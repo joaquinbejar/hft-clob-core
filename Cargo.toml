@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/domain",
+  "crates/matching",
+  "crates/risk",
+  "crates/gateway",
+  "crates/marketdata",
+  "crates/engine",
+  "crates/wire",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Joaquin Bejar <jb@taunais.com>"]
+license = "MIT"
+repository = "https://github.com/joaquinbejar/hft-clob-core"
+keywords = ["hft", "clob", "matching-engine", "low-latency", "trading"]
+categories = ["finance"]
+
+[workspace.dependencies]
+# Internal workspace crates.
+domain     = { path = "crates/domain",     version = "0.1.0" }
+matching   = { path = "crates/matching",   version = "0.1.0" }
+risk       = { path = "crates/risk",       version = "0.1.0" }
+gateway    = { path = "crates/gateway",    version = "0.1.0" }
+marketdata = { path = "crates/marketdata", version = "0.1.0" }
+engine     = { path = "crates/engine",     version = "0.1.0" }
+wire       = { path = "crates/wire",       version = "0.1.0" }
+
+# External local crates — sibling repos, path deps. See CLAUDE.md for relaxations
+# that cover dashmap / uuid / ulid / atomics introduced by these libs.
+pricelevel         = "0.7"
+ironsbe-core       = "0.3"
+ironsbe-schema     = "0.3"
+ironsbe-codegen    = "0.3"
+ironsbe-derive     = "0.3"
+ironsbe-channel    = "0.3"
+ironsbe-transport  = "0.3"
+ironsbe-server     = "0.3"
+ironsbe-client     = "0.3"
+ironsbe-marketdata = "0.3"
+
+# Third-party — single source of truth for versions across crates.
+thiserror         = "2.0"
+anyhow            = "1.0"
+bytes             = "1.11"
+crossbeam         = "0.8"
+crossbeam-queue   = "0.3"
+parking_lot       = "0.12"
+tokio             = { version = "1.52", default-features = false }
+tracing           = "0.1"
+tracing-subscriber = "0.3"
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+hdrhistogram      = "7.5"
+criterion         = { version = "0.8", default-features = false, features = ["html_reports"] }
+proptest          = "1.11"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+debug         = false
+strip         = "symbols"
+
+[profile.bench]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+debug         = true
+
+# Dev profile kept default — fast iteration, no LTO.
