@@ -1,0 +1,15 @@
+//! Single-writer matching core.
+//!
+//! The hot path of the system. Consumes `Command` from the gateway,
+//! applies risk checks, matches orders against the book using price-time
+//! priority, and emits `OutEvent` to the outbound stream.
+//!
+//! Invariants enforced:
+//! - No wall-clock reads (no `SystemTime`, `Instant::now`). Timestamps
+//!   enter via injected `Clock` trait for deterministic replay.
+//! - No randomness (no `rand::*`). ID generation via injected `IdGenerator`.
+//! - No unordered iteration into outputs. Book index is `BTreeMap<Price, _>`
+//!   sorted by price; iteration order is deterministic.
+//! - `engine_seq` is strictly monotonic across all outbound events.
+//!   Checked arithmetic on every increment.
+//! - No tokio, no async. Pure blocking single-writer thread.

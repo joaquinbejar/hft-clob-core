@@ -1,0 +1,26 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+domain = { workspace = true }
+wire = { workspace = true }
+matching = { workspace = true }
+risk = { workspace = true }
+marketdata = { workspace = true }
+gateway = { workspace = true }
+ironsbe-channel = { workspace = true }
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion = { workspace = true, features = ["html_reports"] }
+hdrhistogram.workspace = true
