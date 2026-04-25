@@ -11,6 +11,8 @@ repository.workspace = true
 
 [dependencies]
 domain = { workspace = true }
+wire = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
