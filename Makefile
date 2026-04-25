@@ -8,6 +8,57 @@ ZIP_NAME       = hft-clob-core.zip
 .PHONY: all
 all: test fmt lint release
 
+# Print the most useful targets grouped by purpose.
+.PHONY: help
+help:
+	@echo "hft-clob-core — Makefile targets"
+	@echo ""
+	@echo "Build / lint / format:"
+	@echo "  build              cargo build --workspace (debug)"
+	@echo "  release            cargo build --release --workspace"
+	@echo "  fmt / fmt-check    cargo fmt --all  /  --check"
+	@echo "  lint / lint-fix    cargo clippy -D warnings  /  --fix"
+	@echo "  check              CI gate: fmt-check + lint + test + release"
+	@echo "  smoke              check + replay golden + smoke bench (run before PR)"
+	@echo ""
+	@echo "Tests:"
+	@echo "  test               cargo nextest run --workspace (221 tests)"
+	@echo "  test-<crate>       per-crate runner (matching, risk, engine, gateway, ...)"
+	@echo "  test-verbose       --no-capture (see println! / dbg!)"
+	@echo "  test-failed        only print failures"
+	@echo "  test-stress-stp    run flaky STP test 30x (regression for #10 fix)"
+	@echo "  test-proptest      proptest + invariants only"
+	@echo ""
+	@echo "Run binaries:"
+	@echo "  run                engine listener on 0.0.0.0:9000"
+	@echo "  run-addr ADDR=…    engine listener on a custom address"
+	@echo "  replay             replay fixtures/inbound.bin and diff golden"
+	@echo "  replay-with-ts     replay without --no-timestamps"
+	@echo "  gen-fixture        regenerate fixtures/inbound.bin + outbound.golden"
+	@echo ""
+	@echo "Benchmarks:"
+	@echo "  smoke-bench        smoke_bench binary (10k ops, prints percentiles)"
+	@echo "  bench-quick        Criterion 1s warmup + 3s measurement (~1 min)"
+	@echo "  bench-full         Criterion 5s warmup + 10s measurement (~18 min)"
+	@echo "  bench-show         open Criterion HTML report"
+	@echo "  bench-clean        rm -rf target/criterion"
+	@echo ""
+	@echo "Docker (requires Docker daemon):"
+	@echo "  docker-build       build the multi-stage runtime image"
+	@echo "  docker-up          docker compose up engine (foreground)"
+	@echo "  docker-bench       docker compose run --rm bench"
+	@echo "  docker-replay      docker compose run --rm replay"
+	@echo "  docker-down        docker compose down"
+	@echo ""
+	@echo "Coverage / docs / misc:"
+	@echo "  coverage           tarpaulin XML"
+	@echo "  coverage-html      tarpaulin HTML at coverage/"
+	@echo "  open-coverage      open coverage report"
+	@echo "  doc / doc-open     missing-docs lint  /  cargo doc --open"
+	@echo "  tree               workspace tree -L 3"
+	@echo "  zip                package repo for offline review"
+	@echo "  clean              cargo clean"
+
 # Build the project
 .PHONY: build
 build:
@@ -23,6 +74,49 @@ release:
 .PHONY: test
 test: check-cargo-nextest
 	RUST_LOG=warn cargo nextest run --workspace --no-tests=pass
+
+# Per-crate test runners.
+.PHONY: test-domain test-wire test-matching test-risk test-engine test-gateway test-marketdata
+test-domain: check-cargo-nextest
+	cargo nextest run -p domain
+test-wire: check-cargo-nextest
+	cargo nextest run -p wire
+test-matching: check-cargo-nextest
+	cargo nextest run -p matching
+test-risk: check-cargo-nextest
+	cargo nextest run -p risk
+test-engine: check-cargo-nextest
+	cargo nextest run -p engine
+test-gateway: check-cargo-nextest
+	cargo nextest run -p gateway
+test-marketdata: check-cargo-nextest
+	cargo nextest run -p marketdata
+
+# Verbose run — prints println! / dbg! output from every test.
+.PHONY: test-verbose
+test-verbose: check-cargo-nextest
+	cargo nextest run --workspace --no-capture
+
+# Run failing-only output. Useful after a flaky run.
+.PHONY: test-failed
+test-failed: check-cargo-nextest
+	cargo nextest run --workspace --status-level=fail --no-fail-fast
+
+# Determinism stress: runs the previously-flaky STP test 30 times.
+# Should be 30/30 pass — any FAIL means a regression on the
+# snapshot_orders FIFO fix from #10.
+.PHONY: test-stress-stp
+test-stress-stp: check-cargo-nextest
+	@echo "Running test_stp_after_partial_fill_against_other_account 30 times..."
+	@for i in $$(seq 1 30); do \
+	  cargo nextest run -p matching test_stp_after_partial_fill_against_other_account 2>&1 \
+	    | grep -E "PASS|FAIL" | tail -1; \
+	done | sort | uniq -c
+
+# Property-based tests only (proptest cases under matching + replay).
+.PHONY: test-proptest
+test-proptest: check-cargo-nextest
+	cargo nextest run --workspace -E "test(/proptest_/)" -E "test(/inv_/)"
 
 # Plain `cargo test` fallback for machines without nextest installed.
 .PHONY: test-std
@@ -57,15 +151,81 @@ clean:
 .PHONY: check
 check: fmt-check lint test release
 
-# Run the engine binary (once crates/engine has a [[bin]] target — issue #12/#16).
+# Run the engine binary — listens on 0.0.0.0:9000 by default.
 .PHONY: run
 run:
 	cargo run --release --bin engine
 
-# Run the replay binary (issue #16).
+# Run the engine binary on a custom address.
+# Usage: make run-addr ADDR=127.0.0.1:7000
+ADDR ?= 0.0.0.0:9000
+.PHONY: run-addr
+run-addr:
+	cargo run --release --bin engine -- $(ADDR)
+
+# Replay the committed inbound fixture and diff against the golden.
+# Silent output = byte-identical match.
 .PHONY: replay
 replay:
 	cargo run --release --bin replay -- fixtures/inbound.bin /tmp/outbound.bin --no-timestamps
+	@diff /tmp/outbound.bin fixtures/outbound.golden && echo "GOLDEN MATCHES"
+
+# Replay without --no-timestamps. Two consecutive runs should still
+# match (StubClock is deterministic).
+.PHONY: replay-with-ts
+replay-with-ts:
+	cargo run --release --bin replay -- fixtures/inbound.bin /tmp/outbound-with-ts.bin
+
+# Regenerate the inbound fixture and the matching golden file.
+# Developer-only — CI never runs this.
+.PHONY: gen-fixture
+gen-fixture:
+	cargo run --release --bin gen_fixture -- fixtures/inbound.bin
+	cargo run --release --bin replay -- fixtures/inbound.bin fixtures/outbound.golden --no-timestamps
+	@echo "Regenerated fixtures/inbound.bin and fixtures/outbound.golden"
+
+# Smoke bench — 10k ops, prints p50/p99/p99.9/p99.99/max + throughput.
+.PHONY: smoke-bench
+smoke-bench:
+	cargo run --release --bin smoke_bench
+
+# Full bench (Criterion, default budget). Allow ~18 min wall-clock.
+.PHONY: bench-full
+bench-full:
+	cargo bench --bench add_cancel_mix
+
+# Quick sanity bench — 1s warmup + 3s measurement, 10 samples.
+.PHONY: bench-quick
+bench-quick:
+	cargo bench --bench add_cancel_mix -- --warm-up-time 1 --measurement-time 3 --sample-size 10
+
+# Docker — zero-host-setup. Requires Docker daemon running.
+.PHONY: docker-build
+docker-build:
+	docker compose -f docker/docker-compose.yml build
+
+.PHONY: docker-up
+docker-up:
+	docker compose -f docker/docker-compose.yml up engine
+
+.PHONY: docker-bench
+docker-bench:
+	docker compose -f docker/docker-compose.yml run --rm bench
+
+.PHONY: docker-replay
+docker-replay:
+	docker compose -f docker/docker-compose.yml run --rm replay
+
+.PHONY: docker-down
+docker-down:
+	docker compose -f docker/docker-compose.yml down
+
+# End-to-end smoke: full gate + replay golden + smoke bench.
+# Use this before opening a PR.
+.PHONY: smoke
+smoke: fmt-check lint test release replay smoke-bench
+	@echo ""
+	@echo "smoke OK — fmt, clippy, nextest, release build, replay golden, smoke bench all green"
 
 .PHONY: fix
 fix:
