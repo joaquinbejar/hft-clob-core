@@ -82,10 +82,104 @@ pub struct ExecReport {
     pub emit_ts: RecvTs,
 }
 
+/// Validate that an [`ExecReport`]'s state-dependent fields are
+/// internally consistent. Used by both [`parse`] (after raw decode) and
+/// to document the required pairings:
+///
+/// | `state`            | required `Some` fields           | required `None` fields                                |
+/// |--------------------|----------------------------------|-------------------------------------------------------|
+/// | `Accepted`         | `leaves_qty`                     | `fill_*`, `reject_reason`, `cancel_reason`            |
+/// | `Rejected`         | `reject_reason`                  | `fill_*`, `leaves_qty`, `cancel_reason`               |
+/// | `PartiallyFilled`  | `fill_price`, `fill_qty`, `leaves_qty` | `reject_reason`, `cancel_reason`                |
+/// | `Filled`           | `fill_price`, `fill_qty`         | `leaves_qty`, `reject_reason`, `cancel_reason`        |
+/// | `Cancelled`        | `cancel_reason`                  | `fill_*`, `leaves_qty`, `reject_reason`               |
+/// | `Replaced`         | `cancel_reason`                  | `fill_*`, `leaves_qty`, `reject_reason`               |
+fn validate_coherent(msg: &ExecReport) -> Result<(), WireError> {
+    let has_fill = msg.fill_price.is_some() || msg.fill_qty.is_some();
+    let has_both_fill_fields = msg.fill_price.is_some() && msg.fill_qty.is_some();
+
+    match msg.state {
+        ExecState::Accepted => {
+            if has_fill || msg.reject_reason.is_some() || msg.cancel_reason.is_some() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Accepted requires no fill / reject / cancel fields",
+                ));
+            }
+            if msg.leaves_qty.is_none() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Accepted requires leaves_qty",
+                ));
+            }
+        }
+        ExecState::Rejected => {
+            if has_fill || msg.leaves_qty.is_some() || msg.cancel_reason.is_some() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Rejected requires reject_reason only",
+                ));
+            }
+            if msg.reject_reason.is_none() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Rejected requires reject_reason",
+                ));
+            }
+        }
+        ExecState::PartiallyFilled => {
+            if !has_both_fill_fields {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: PartiallyFilled requires both fill_price and fill_qty",
+                ));
+            }
+            if msg.leaves_qty.is_none() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: PartiallyFilled requires leaves_qty",
+                ));
+            }
+            if msg.reject_reason.is_some() || msg.cancel_reason.is_some() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: PartiallyFilled cannot carry reject / cancel reason",
+                ));
+            }
+        }
+        ExecState::Filled => {
+            if !has_both_fill_fields {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Filled requires both fill_price and fill_qty",
+                ));
+            }
+            if msg.leaves_qty.is_some() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Filled is terminal — leaves_qty must be None",
+                ));
+            }
+            if msg.reject_reason.is_some() || msg.cancel_reason.is_some() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Filled cannot carry reject / cancel reason",
+                ));
+            }
+        }
+        ExecState::Cancelled | ExecState::Replaced => {
+            if has_fill || msg.leaves_qty.is_some() || msg.reject_reason.is_some() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Cancelled / Replaced require cancel_reason only",
+                ));
+            }
+            if msg.cancel_reason.is_none() {
+                return Err(WireError::InconsistentPayload(
+                    "ExecReport: Cancelled / Replaced require cancel_reason",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decode `ExecReport` from a payload.
 ///
 /// # Errors
-/// [`WireError`] on size mismatch, non-zero pad, or domain validation.
+/// [`WireError::PayloadSize`] / [`WireError::NonZeroPad`] / [`WireError::Domain`]
+/// on the usual decode failures, plus [`WireError::InconsistentPayload`]
+/// when the decoded message violates the state→fields contract
+/// documented in [`validate_coherent`].
 pub fn parse(payload: &[u8]) -> Result<ExecReport, WireError> {
     let w = ExecReportWire::ref_from_bytes(payload).map_err(|_| WireError::PayloadSize {
         expected: SIZE,
@@ -126,7 +220,7 @@ pub fn parse(payload: &[u8]) -> Result<ExecReport, WireError> {
         None
     };
 
-    Ok(ExecReport {
+    let msg = ExecReport {
         engine_seq,
         order_id,
         account_id,
@@ -138,22 +232,65 @@ pub fn parse(payload: &[u8]) -> Result<ExecReport, WireError> {
         cancel_reason,
         recv_ts: RecvTs::new(w.recv_ts as i64),
         emit_ts: RecvTs::new(w.emit_ts as i64),
-    })
+    };
+    validate_coherent(&msg)?;
+    Ok(msg)
 }
 
 /// Encode `ExecReport` into a payload buffer.
+///
+/// Canonicalises state-irrelevant fields to the wire-zero sentinel
+/// based on `msg.state`, so a sloppy caller cannot produce a wire
+/// payload that contradicts the spec table in `docs/protocol.md`.
+/// Specifically:
+///
+/// - `reject_reason` is only encoded when `state == Rejected`.
+/// - `cancel_reason` is only encoded when `state ∈ {Cancelled, Replaced}`.
+/// - `fill_price` / `fill_qty` are only encoded when `state ∈
+///   {PartiallyFilled, Filled}`, and only as a pair (if either is
+///   `None` the pair is zeroed).
+/// - `leaves_qty` is only encoded when `state ∈ {Accepted,
+///   PartiallyFilled}`; on terminal states it is forced to zero.
 pub fn encode(msg: &ExecReport, out: &mut Vec<u8>) {
+    let state = msg.state;
+
+    let reject_reason = if state == ExecState::Rejected {
+        msg.reject_reason.map(RejectReason::as_u8).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let cancel_reason = if matches!(state, ExecState::Cancelled | ExecState::Replaced) {
+        msg.cancel_reason.map(CancelReason::as_u8).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let (fill_price, fill_qty) = match (state, msg.fill_price, msg.fill_qty) {
+        (ExecState::PartiallyFilled | ExecState::Filled, Some(p), Some(q)) => {
+            (p.as_ticks(), q.as_lots())
+        }
+        _ => (0, 0),
+    };
+
+    let leaves_qty = match state {
+        ExecState::Accepted | ExecState::PartiallyFilled => {
+            msg.leaves_qty.map(Qty::as_lots).unwrap_or(0)
+        }
+        ExecState::Filled | ExecState::Rejected | ExecState::Cancelled | ExecState::Replaced => 0,
+    };
+
     let w = ExecReportWire {
         engine_seq: msg.engine_seq.as_raw(),
         order_id: msg.order_id.as_raw(),
         account_id: msg.account_id.as_raw(),
-        state: msg.state.as_u8(),
-        reject_reason: msg.reject_reason.map(RejectReason::as_u8).unwrap_or(0),
-        cancel_reason: msg.cancel_reason.map(CancelReason::as_u8).unwrap_or(0),
+        state: state.as_u8(),
+        reject_reason,
+        cancel_reason,
         _pad0: 0,
-        fill_price: msg.fill_price.map(Price::as_ticks).unwrap_or(0),
-        fill_qty: msg.fill_qty.map(Qty::as_lots).unwrap_or(0),
-        leaves_qty: msg.leaves_qty.map(Qty::as_lots).unwrap_or(0),
+        fill_price,
+        fill_qty,
+        leaves_qty,
         recv_ts: msg.recv_ts.as_nanos() as u64,
         emit_ts: msg.emit_ts.as_nanos() as u64,
     };
@@ -253,5 +390,51 @@ mod tests {
         encode(&sample_accepted(), &mut buf);
         buf[PAD0_OFFSET] = 0xFF;
         assert_eq!(parse(&buf), Err(WireError::NonZeroPad(PAD0_OFFSET)));
+    }
+
+    /// `state == Accepted` paired with a non-zero `reject_reason` byte
+    /// is malformed. The decoder must reject after raw decode.
+    #[test]
+    fn test_exec_report_accepted_with_reject_reason_returns_err() {
+        let mut buf = Vec::new();
+        encode(&sample_accepted(), &mut buf);
+        // reject_reason is at offset 21 (after engine_seq + order_id +
+        // account_id + state).
+        buf[21] = RejectReason::PriceBand.as_u8();
+        assert!(matches!(
+            parse(&buf),
+            Err(WireError::InconsistentPayload(_))
+        ));
+    }
+
+    /// `state == Rejected` without a `reject_reason` byte is malformed.
+    #[test]
+    fn test_exec_report_rejected_without_reason_returns_err() {
+        let mut buf = Vec::new();
+        encode(&sample_rejected(), &mut buf);
+        buf[21] = 0; // clear reject_reason
+        assert!(matches!(
+            parse(&buf),
+            Err(WireError::InconsistentPayload(_))
+        ));
+    }
+
+    /// `encode` canonicalises state-irrelevant fields. A sloppy caller
+    /// that puts a `reject_reason` on an `Accepted` report sees that
+    /// reason silently dropped on the wire — the decoded message comes
+    /// back without it.
+    #[test]
+    fn test_exec_report_encode_canonicalises_irrelevant_fields() {
+        let mut sloppy = sample_accepted();
+        sloppy.reject_reason = Some(RejectReason::PriceBand); // not allowed on Accepted
+        sloppy.cancel_reason = Some(CancelReason::UserRequested); // also not allowed
+
+        let mut buf = Vec::new();
+        encode(&sloppy, &mut buf);
+        // Decode and verify the canonicalised version came back clean.
+        let decoded = parse(&buf).expect("decode");
+        assert_eq!(decoded.state, ExecState::Accepted);
+        assert!(decoded.reject_reason.is_none());
+        assert!(decoded.cancel_reason.is_none());
     }
 }

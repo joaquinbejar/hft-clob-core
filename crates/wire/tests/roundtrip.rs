@@ -375,13 +375,11 @@ prop_compose! {
 prop_compose! {
     fn arb_book_update_top()(
         engine_seq in arb_engine_seq(),
-        bid_price in proptest::option::of(arb_price()),
-        bid_qty in proptest::option::of(arb_qty()),
-        ask_price in proptest::option::of(arb_price()),
-        ask_qty in proptest::option::of(arb_qty()),
+        bid in proptest::option::of((arb_price(), arb_qty())),
+        ask in proptest::option::of((arb_price(), arb_qty())),
         emit_ts in arb_recv_ts(),
     ) -> BookUpdateTop {
-        BookUpdateTop { engine_seq, bid_price, bid_qty, ask_price, ask_qty, emit_ts }
+        BookUpdateTop { engine_seq, bid, ask, emit_ts }
     }
 }
 
