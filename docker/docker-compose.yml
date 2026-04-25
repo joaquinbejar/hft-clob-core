@@ -1,0 +1,46 @@
+# Bring up the engine listener and run a smoke bench from a clean
+# clone with `docker compose up engine` and `docker compose run --rm
+# bench`. Both services share the same image — the bench service
+# overrides ENTRYPOINT to run the smoke_bench binary instead of the
+# long-lived listener.
+#
+# Build context is the workspace root. The Dockerfile lives in
+# `docker/Dockerfile`; `dockerfile:` makes the path explicit.
+
+services:
+  engine:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hft-clob-core:dev
+    container_name: hft-clob-engine
+    ports:
+      - "9000:9000"
+    # Engine binary entrypoint defaults to listening on
+    # 0.0.0.0:9000. Override via `command:` if a different bind
+    # address is needed in compose.
+    restart: on-failure
+
+  bench:
+    image: hft-clob-core:dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: hft-clob-bench
+    entrypoint: ["/app/smoke_bench"]
+    # bench is a one-shot — `docker compose run --rm bench` is the
+    # canonical invocation. Don't auto-start as part of `up`.
+    profiles: ["bench"]
+
+  replay:
+    image: hft-clob-core:dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: hft-clob-replay
+    entrypoint: ["/app/replay"]
+    command:
+      - "/app/fixtures/inbound.bin"
+      - "/tmp/out.bin"
+      - "--no-timestamps"
+    profiles: ["bench"]

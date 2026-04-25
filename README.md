@@ -142,9 +142,9 @@ message bodies.
 
 ### Engine + gateway (live TCP)
 
-A single-binary deployment is the `engine` crate's main path; for
-v1 the binary's command-line wiring lives behind a follow-up issue,
-but the components compose:
+The single-binary deployment is the `engine` crate's `engine`
+binary, which spawns the tokio gateway listener and the dedicated
+matching thread.
 
 ```bash
 # Run the test suite end-to-end (matching, risk, engine, wire,
@@ -153,7 +153,29 @@ cargo nextest run
 
 # Verify the workspace builds in release with LTO.
 cargo build --release
+
+# Run the engine listener on the default 0.0.0.0:9000.
+cargo run --release --bin engine
 ```
+
+### Docker — zero-host-setup path
+
+```bash
+# Bring up the engine listener (foreground; ^C to stop).
+docker compose -f docker/docker-compose.yml up engine
+
+# Run the small `add_cancel_mix` smoke bench (10 k ops; prints
+# p50 / p99 / p99.9 / p99.99 / max plus throughput).
+docker compose -f docker/docker-compose.yml run --rm bench
+
+# Run the replay binary against the committed fixture.
+docker compose -f docker/docker-compose.yml run --rm replay
+```
+
+The runtime image is `debian:bookworm-slim` plus three release
+binaries (`engine`, `smoke_bench`, `replay`) and the committed
+`fixtures/`, well under 300 MB. No host-side install beyond
+Docker.
 
 ### Replay against the golden file
 
