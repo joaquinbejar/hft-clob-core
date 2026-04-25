@@ -43,6 +43,8 @@ pub enum MessageKind {
     BookUpdateTop = 0x67,
     /// `BookUpdateL2Delta` — per-level depth delta.
     BookUpdateL2Delta = 0x68,
+    /// `SnapshotResponse` — variable-length book + engine state dump.
+    SnapshotResponse = 0x69,
 }
 
 impl MessageKind {
@@ -69,6 +71,7 @@ impl TryFrom<u8> for MessageKind {
             0x66 => Ok(Self::TradePrint),
             0x67 => Ok(Self::BookUpdateTop),
             0x68 => Ok(Self::BookUpdateL2Delta),
+            0x69 => Ok(Self::SnapshotResponse),
             other => Err(WireError::UnknownKind(other)),
         }
     }

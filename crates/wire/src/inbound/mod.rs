@@ -63,6 +63,7 @@ pub fn parse_frame(frame: Frame<'_>) -> Result<Inbound, WireError> {
         outbound @ (MessageKind::ExecReport
         | MessageKind::TradePrint
         | MessageKind::BookUpdateTop
-        | MessageKind::BookUpdateL2Delta) => Err(WireError::UnknownKind(outbound.as_u8())),
+        | MessageKind::BookUpdateL2Delta
+        | MessageKind::SnapshotResponse) => Err(WireError::UnknownKind(outbound.as_u8())),
     }
 }

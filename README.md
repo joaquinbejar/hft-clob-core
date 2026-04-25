@@ -108,10 +108,7 @@ encoders, decoders, and roundtrip tests.
 | 102  | 0x66  | `TradePrint`        | 48 bytes     | Public trade emission                              |
 | 103  | 0x67  | `BookUpdateTop`     | 48 bytes     | Top-of-book on every book change                   |
 | 104  | 0x68  | `BookUpdateL2Delta` | 40 bytes     | Per-level depth delta (level removed when `new_qty = 0`) |
-
-`SnapshotResponse` (105) is intentionally absent from the bespoke
-fixed-size pattern; the variable-length book depth array lives behind a
-separate framing scheme to be added under a later issue.
+| 105  | 0x69  | `SnapshotResponse`  | variable     | Variable-length book + engine state dump in response to `SnapshotRequest`. Layout: `[engine_seq u64][request_id u64][recv_ts u64][emit_ts u64][n_bid u32][n_ask u32][bid levels][ask levels]`, each level `[price i64][qty u64]`. Bids best-first (descending), asks best-first (ascending). |
 
 ### Decode invariants
 

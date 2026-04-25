@@ -637,6 +637,25 @@ impl Book {
         self.asks.keys().next().copied()
     }
 
+    /// Iterate the bid side as `(price, total_qty)` pairs in **best-first**
+    /// (descending price) order. Drives deterministic snapshot
+    /// emission — the underlying `BTreeMap` already iterates in sorted
+    /// order; we reverse for "best bid first".
+    pub fn bid_levels(&self) -> impl Iterator<Item = (Price, u64)> + '_ {
+        self.bids
+            .iter()
+            .rev()
+            .map(|(price, level)| (*price, level.total_quantity().unwrap_or(0)))
+    }
+
+    /// Iterate the ask side as `(price, total_qty)` pairs in **best-first**
+    /// (ascending price) order.
+    pub fn ask_levels(&self) -> impl Iterator<Item = (Price, u64)> + '_ {
+        self.asks
+            .iter()
+            .map(|(price, level)| (*price, level.total_quantity().unwrap_or(0)))
+    }
+
     /// Sum of resting quantity on a side, in lots. O(n) over the price
     /// levels; intended for tests and snapshots, not the hot path.
     #[must_use]

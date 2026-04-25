@@ -1,23 +1,26 @@
 //! Outbound (engine → client / market-data) message types.
 //!
-//! Each submodule exposes a `parse(payload: &[u8]) -> Result<X, WireError>`
-//! and `encode(msg: &X, out: &mut Vec<u8>)` pair plus the
+//! Each fixed-size submodule exposes a
+//! `parse(payload: &[u8]) -> Result<X, WireError>` and
+//! `encode(msg: &X, out: &mut Vec<u8>)` pair plus the
 //! `XxxWire` `#[repr(C, packed)]` layout struct.
 //!
+//! [`snapshot_response`] is the only outbound message with a
+//! variable-length payload; its layout is documented in that
+//! module. The framing prefix is identical for every kind.
+//!
 //! [`Outbound`] is the dispatched union the marketdata sink consumes.
-//! `SnapshotResponse` (kind = 0x69 / 105) is intentionally absent —
-//! the variable-length book depth array conflicts with the bespoke
-//! fixed-size pattern this crate uses, so it lives behind a separate
-//! framing scheme to be added under a later issue.
 
 pub mod book_update_l2_delta;
 pub mod book_update_top;
 pub mod exec_report;
+pub mod snapshot_response;
 pub mod trade_print;
 
 pub use book_update_l2_delta::BookUpdateL2Delta;
 pub use book_update_top::BookUpdateTop;
 pub use exec_report::ExecReport;
+pub use snapshot_response::SnapshotResponse;
 pub use trade_print::TradePrint;
 
 use crate::WireError;
@@ -34,6 +37,8 @@ pub enum Outbound {
     BookUpdateTop(BookUpdateTop),
     /// `BookUpdateL2Delta` — per-level depth delta.
     BookUpdateL2Delta(BookUpdateL2Delta),
+    /// `SnapshotResponse` — variable-length book + engine state dump.
+    SnapshotResponse(SnapshotResponse),
 }
 
 /// Parse an outbound frame into its typed variant.
@@ -53,6 +58,9 @@ pub fn parse_frame(frame: Frame<'_>) -> Result<Outbound, WireError> {
         }
         MessageKind::BookUpdateL2Delta => {
             book_update_l2_delta::parse(frame.payload).map(Outbound::BookUpdateL2Delta)
+        }
+        MessageKind::SnapshotResponse => {
+            snapshot_response::parse(frame.payload).map(Outbound::SnapshotResponse)
         }
         inbound @ (MessageKind::NewOrder
         | MessageKind::CancelOrder
