@@ -5,4 +5,4 @@
 //! schema and code generation. All lengths are little-endian; framing is
 //! length-prefixed TCP (first 4 bytes = message length in bytes).
 //!
-//! Roundtrip tests verify encode → decode preserves all fields byte-identically.
+//! Roundtrip tests will verify encode → decode preserves all fields byte-identically (issue #5).

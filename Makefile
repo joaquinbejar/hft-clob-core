@@ -17,7 +17,7 @@ build:
 release:
 	cargo build --release --workspace
 
-# Run tests via nextest (preferred by CLAUDE.md over `cargo test`).
+# Run tests via nextest (preferred by matching codebase over `cargo test`).
 # `--no-tests=pass` tolerates empty crates during early bring-up;
 # remove once every crate carries at least one test.
 .PHONY: test
@@ -118,17 +118,23 @@ coverage-json: check-cargo-tarpaulin
 
 .PHONY: open-coverage
 open-coverage:
-	open coverage/tarpaulin-report.html
+	@if [ -f coverage/tarpaulin-report.html ]; then \
+		if command -v open > /dev/null; then open coverage/tarpaulin-report.html; \
+		else echo "Open coverage/tarpaulin-report.html in your browser"; fi; \
+	else echo "coverage/tarpaulin-report.html not found. Run 'make coverage' first."; fi
 
 # Benchmarks via cargo-criterion. HDR histogram reporting lives inside
-# each bench binary — see BENCH.md for methodology.
+# each bench binary — detailed methodology documented in BENCH.md (issue #17).
 .PHONY: bench
 bench: check-cargo-criterion
 	cargo criterion --workspace --output-format=quiet
 
 .PHONY: bench-show
 bench-show:
-	open target/criterion/reports/index.html
+	@if [ -f target/criterion/reports/index.html ]; then \
+		if command -v open > /dev/null; then open target/criterion/reports/index.html; \
+		else echo "Open target/criterion/reports/index.html in your browser"; fi; \
+	else echo "target/criterion/reports/index.html not found. Run 'make bench' first."; fi
 
 .PHONY: bench-save
 bench-save: check-cargo-criterion

@@ -1,8 +1,8 @@
 //! Single-writer matching core.
 //!
-//! The hot path of the system. Consumes `Command` from the gateway,
-//! applies risk checks, matches orders against the book using price-time
-//! priority, and emits `OutEvent` to the outbound stream.
+//! The hot path of the system. Consumes orders that have passed risk validation,
+//! matches them against the book using price-time priority, and emits
+//! `OutEvent` to the outbound stream.
 //!
 //! Invariants enforced:
 //! - No wall-clock reads (no `SystemTime`, `Instant::now`). Timestamps
