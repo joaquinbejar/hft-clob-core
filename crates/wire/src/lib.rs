@@ -15,8 +15,12 @@
 //! - `KillSwitchSet` (0x05)
 //! - `SnapshotRequest` (0x06)
 //!
-//! Outbound message kinds (issue #5) will live behind a future
-//! `crate::outbound` module.
+//! Outbound message kinds (this crate, issue #5):
+//!
+//! - `ExecReport` (0x65)
+//! - `TradePrint` (0x66)
+//! - `BookUpdateTop` (0x67)
+//! - `BookUpdateL2Delta` (0x68)
 
 #![warn(missing_docs)]
 
@@ -32,6 +36,7 @@ compile_error!(
 pub mod error;
 pub mod framing;
 pub mod inbound;
+pub mod outbound;
 
 pub use error::WireError;
 pub use framing::{FRAME_HEADER_BYTES, FRAME_KIND_BYTES, FRAME_LEN_BYTES, Frame, MessageKind};

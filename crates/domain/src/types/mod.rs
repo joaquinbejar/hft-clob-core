@@ -11,6 +11,7 @@ mod recv_ts;
 mod trade_id;
 
 mod cancel_reason;
+mod exec_state;
 mod order_type;
 mod reject_reason;
 mod side;
@@ -26,6 +27,7 @@ pub use recv_ts::RecvTs;
 pub use trade_id::{TradeId, TradeIdError};
 
 pub use cancel_reason::{CancelReason, CancelReasonError};
+pub use exec_state::{ExecState, ExecStateError};
 pub use order_type::{OrderType, OrderTypeError};
 pub use reject_reason::{RejectReason, RejectReasonError};
 pub use side::{Side, SideError};

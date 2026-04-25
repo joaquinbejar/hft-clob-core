@@ -8,8 +8,8 @@
 use thiserror::Error;
 
 use crate::types::{
-    AccountIdError, CancelReasonError, EngineSeqError, OrderIdError, OrderTypeError, PriceError,
-    QtyError, RejectReasonError, SideError, TifError, TradeIdError,
+    AccountIdError, CancelReasonError, EngineSeqError, ExecStateError, OrderIdError,
+    OrderTypeError, PriceError, QtyError, RejectReasonError, SideError, TifError, TradeIdError,
 };
 
 /// Aggregator over every per-type validation / decode error in the
@@ -50,4 +50,7 @@ pub enum DomainError {
     /// `CancelReason` decode.
     #[error(transparent)]
     CancelReason(#[from] CancelReasonError),
+    /// `ExecState` decode.
+    #[error(transparent)]
+    ExecState(#[from] ExecStateError),
 }

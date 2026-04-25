@@ -27,7 +27,7 @@ pub mod types;
 pub use error::DomainError;
 pub use types::{
     AccountId, AccountIdError, CancelReason, CancelReasonError, ClientTs, EngineSeq,
-    EngineSeqError, OrderId, OrderIdError, OrderType, OrderTypeError, Price, PriceError, Qty,
-    QtyError, RecvTs, RejectReason, RejectReasonError, Side, SideError, Tif, TifError, TradeId,
-    TradeIdError,
+    EngineSeqError, ExecState, ExecStateError, OrderId, OrderIdError, OrderType, OrderTypeError,
+    Price, PriceError, Qty, QtyError, RecvTs, RejectReason, RejectReasonError, Side, SideError,
+    Tif, TifError, TradeId, TradeIdError,
 };

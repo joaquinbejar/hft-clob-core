@@ -43,7 +43,10 @@ pub enum Inbound {
 /// Parse an inbound frame into its typed variant.
 ///
 /// # Errors
-/// Propagates any [`WireError`] from the per-message decoder.
+/// Propagates any [`WireError`] from the per-message decoder. Returns
+/// [`WireError::UnknownKind`] when the frame carries an outbound kind
+/// (those discriminants are valid in [`MessageKind`] but not legal on
+/// the inbound stream).
 #[inline]
 pub fn parse_frame(frame: Frame<'_>) -> Result<Inbound, WireError> {
     match frame.kind {
@@ -57,5 +60,9 @@ pub fn parse_frame(frame: Frame<'_>) -> Result<Inbound, WireError> {
         MessageKind::SnapshotRequest => {
             snapshot_request::parse(frame.payload).map(Inbound::SnapshotRequest)
         }
+        outbound @ (MessageKind::ExecReport
+        | MessageKind::TradePrint
+        | MessageKind::BookUpdateTop
+        | MessageKind::BookUpdateL2Delta) => Err(WireError::UnknownKind(outbound.as_u8())),
     }
 }
