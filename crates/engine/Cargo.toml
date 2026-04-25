@@ -24,3 +24,7 @@ tracing.workspace = true
 proptest.workspace = true
 criterion = { workspace = true, features = ["html_reports"] }
 hdrhistogram.workspace = true
+
+[[bench]]
+name = "add_cancel_mix"
+harness = false
