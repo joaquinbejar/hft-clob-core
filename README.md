@@ -382,5 +382,112 @@ compatible decode of future schema versions.
   `Recorder`, so the listener's hot loop has no
   `Option<&mut Recorder>` branch to guard.
 
-The microstructure write-up — CLOB vs batch auction vs RFQ, plus
-honest limitations — lives in the section landing under issue #19.
+## Microstructure
+
+A continuous central-limit order book is the right shape for a
+single-symbol on-chain-settled spot venue **only if** the trade
+tape is the source of truth and the venue can absorb cancel /
+amend bursts without leaking the resting queue. Below is the
+short version of the design pressure that landed us here.
+
+### Why price-time priority + cancel-both STP
+
+Price-time is the only allocation rule that survives both
+adversarial inspection and naive scrutiny without invoking
+participant-specific logic (size pro-rata privileges large
+desks; volume-weighted pro-rata privileges momentum). FIFO
+within a price level is information-cheap: every participant
+knows the rank of their order from the ack alone, no model
+of the book microstate required.
+
+Self-trade prevention is **cancel-both** (drop the resting
+maker, halt the walk, cancel the taker irrespective of TIF).
+The alternative — "cancel the maker, fill the taker against
+the next queue entry" — is operationally simpler but it lets
+an account use its own resting maker as a free trigger to
+skip the queue against an unrelated counterparty (the
+maker's residual evaporates the moment the same-account
+taker arrives, so the taker's effective priority jumps). That
+is a priority-jump primitive that none of the legitimate
+order types we ship can build, and cancel-both denies it
+entirely. The cost is a slightly worse fill on shallow books;
+the benefit is no class of trade that exists only because the
+participant owned both sides.
+
+### CLOB vs frequent batch auction vs RFQ for a ZK-settled crypto venue
+
+A frequent batch auction (FBA) — Budish-style, 100 ms cadence
+or similar — does genuinely eliminate the *intra-batch*
+latency race by construction: every inbound that lands in the
+batch clears at one uniform price, so there is no time
+priority to game once the batch closes. The case against it
+for *this* deployment is that intra-batch fairness is not the
+threat model we are defending:
+
+1. **The threat model is verifiable post-hoc reconstruction.**
+   On a ZK-settled venue the trust anchor downstream is the
+   prover, not the matching policy — every participant
+   eventually verifies what cleared. The microstructure layer's
+   job is to make the inbound → outbound mapping legible and
+   reproducible, which `fixtures/outbound.golden` demonstrates
+   end-to-end. An FBA shifts the within-batch race away but
+   does not remove sequencer trust: the sequencer still picks
+   which inbound goes into which batch, and the
+   inclusion-time-vs-clearing-time gap is the surface that an
+   adversarial sequencer (or a co-located arbitrageur with a
+   private feed of inclusion decisions) exploits. Legibility of
+   the continuous tape closes that surface; uniform-price
+   clearing inside the batch does not.
+2. **ZK proving cadence vs auction cadence.** The settlement
+   layer's proof-generation cadence (single-digit seconds at
+   best for current SNARK stacks on a non-trivial program) is
+   already an order of magnitude slower than an FBA's natural
+   100 ms tick. Layering an FBA *on top* of an already-batched
+   ZK rollup leaves you with two synchronisation regimes whose
+   offsets you have to reason about; the latency advantage of
+   the inner FBA is then bounded by the outer prover's slack.
+   For a venue whose committed delivery is "trade now, settle
+   in a ZK proof later," continuous matching gives the
+   participant a price they can quote against immediately and
+   the prover catches up asynchronously.
+
+RFQ is the other plausible shape — appropriate for a venue
+where the order flow is overwhelmingly large block trades and
+the cost of revealing intent on the tape exceeds the value of
+the public price discovery. Spot crypto on a single retail-tier
+symbol is the opposite regime: order count is high, average
+size is small, and the public tape is a feature for everyone
+who is not a block-flow specialist. CLOB wins on the spec's
+target market.
+
+### Honest limitation: per-level snapshot allocation on the fill loop
+
+The matching core is single-writer and `Engine::step` runs
+~40 ns p50 (see [`BENCH.md`](BENCH.md)). The current p99.9
+tail (~210 µs) lives almost entirely in one place: every level
+the fill loop enters calls `pricelevel::PriceLevel::snapshot_orders()`,
+which iterates the level's `DashMap` and `sort_by_key` into a
+fresh `Vec<Arc<OrderType<()>>>`. We pay that cost because
+pricelevel's `iter_orders()` walks the DashMap in hash order
+and is explicitly documented as not FIFO-stable — we observed
+it in CI as flake on a same-price multi-maker STP test. Strict
+price-time priority is non-negotiable, so the snapshot is the
+v1 trade-off.
+
+The evolution is a Book-side `BTreeMap<Price, VecDeque<OrderId>>`
+mirror that we own and append to from `add_resting`. The fill
+loop then peeks the FIFO front in O(1) and pops on full fill,
+no Arc clones, no allocation. The matching crate already
+holds the per-order metadata sidecar (`HashMap<OrderId,
+OrderMeta>`); adding the per-level FIFO is structural, not a
+new abstraction. After that lands the next contention point
+moves to the outbound side: the engine's broadcast send
+currently walks every subscriber serially on the engine
+thread, so as session count grows the engine's tail becomes a
+function of N. The clean shape is an SPMC ring per *kind* of
+stream (trades + book updates fanning out from one producer;
+per-session exec reports staying paired with their session) so
+the engine's latency is a function of `num_kinds` rather than
+`num_sessions`. Both of these land cleanly because matching
+binds to `OutboundSink`, not to the broadcast channel — the
+topology change is a sink swap in one place.
