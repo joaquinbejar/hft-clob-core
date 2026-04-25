@@ -163,6 +163,13 @@ ADDR ?= 0.0.0.0:9000
 run-addr:
 	cargo run --release --bin engine -- $(ADDR)
 
+# Run the engine binary with the matching thread pinned to a core.
+# Usage: make run-pinned CORE=4
+CORE ?= 0
+.PHONY: run-pinned
+run-pinned:
+	cargo run --release --features pinned-engine --bin engine -- $(ADDR) --engine-core $(CORE)
+
 # Replay the committed inbound fixture and diff against the golden.
 # Silent output = byte-identical match.
 .PHONY: replay

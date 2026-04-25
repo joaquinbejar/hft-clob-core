@@ -62,6 +62,7 @@ zerocopy          = { version = "0.8", features = ["derive"] }
 uuid              = "1"
 tempfile          = "3"
 dhat              = "0.3"
+core_affinity     = "0.8"
 
 [profile.release]
 opt-level     = 3

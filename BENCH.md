@@ -23,7 +23,7 @@ discipline.
 | RNG | Seeded LCG inside the bench (no `rand::*`, deterministic) |
 | Sink | `engine::VecSink` with `events.clear()` per op (drains, never mutates external state) |
 | Clock | `BenchClock` — synthetic monotonic, one tick per `now()` call |
-| CPU pinning | None (default macOS scheduler); pinning to the perf cores is future work |
+| CPU pinning | Optional via `pinned-engine` feature + `--engine-core <N>`. Default off — Linux is the supported target; macOS treats the affinity hint as a soft QoS bias. |
 | Coordinated-omission correction | **None at the bench level**. The bench drives synchronous `step()` calls in a tight loop; there is no arrival-rate target, so the classical CO failure mode (a slow op delays the next request and hides the slow op from the histogram) does not apply. Histogram values are raw `t_end - t_start` per op. When this bench grows a closed-loop driver (issue 17 follow-up), `Histogram::record_correct(value, expected_interval)` will replace `record(value)`. |
 
 The driver is `criterion::iter_batched` with `BatchSize::SmallInput`
@@ -68,6 +68,38 @@ across the captured-budget run is already in line with the
 microstructure cost model (matching is dominated by the
 `snapshot_orders()` allocation per level entry, which is the next
 target — see "Where the tail comes from" below).
+
+## CPU pinning + NUMA placement
+
+The engine binary supports CPU pinning behind a feature flag —
+recommended on Linux for production runs and bench laps where p99.99 /
+max are interesting.
+
+```bash
+cargo run --release --features pinned-engine --bin engine -- 0.0.0.0:9000 --engine-core 4
+```
+
+What pinning actually does:
+
+- Linux: `core_affinity::set_for_current` calls `sched_setaffinity(2)`
+  with a single-CPU mask. The matching thread stops migrating across
+  cores. Combined with `taskset` / `cpuset` cgroups isolating the
+  chosen core from other workloads, the p99.99 tail collapses
+  toward p99 because OS scheduler preemption disappears.
+- macOS: the same `core_affinity` call maps to a QoS hint
+  (`pthread_set_qos_class_self_np`-style). Effect is real but
+  smaller than on Linux — reproducible numbers there require a
+  Linux box.
+
+NUMA placement is intentionally out of scope for v1 (single-symbol,
+single-thread engine doesn't have a memory-locality story to tell
+yet). When the SPMC outbound bipartite split lands per the README's
+"honest limitation" section, the producer / consumer threads should
+co-locate on the same NUMA node — that's a follow-up issue.
+
+Without the `pinned-engine` feature, `--engine-core` is parsed but
+ignored with a warning. The unpinned path is what the captured
+numbers in this document reflect.
 
 ## Sustained throughput
 

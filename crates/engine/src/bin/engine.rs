@@ -5,13 +5,23 @@
 //! ## CLI
 //!
 //! ```text
-//! engine [bind_addr]
+//! engine [bind_addr] [--engine-core <N>]
 //! ```
 //!
 //! Default bind address `0.0.0.0:9000`. Connected clients can
 //! submit framed inbound messages and read framed outbound bytes
-//! (`ExecReport` / `TradePrint` / `BookUpdateTop` / `SnapshotResponse`)
-//! on the same TCP connection.
+//! (`ExecReport` / `TradePrint` / `BookUpdateTop` /
+//! `BookUpdateL2Delta` / `SnapshotResponse`) on the same TCP
+//! connection.
+//!
+//! `--engine-core <N>` pins the matching thread to physical core
+//! `N` via `core_affinity::set_for_current`. Requires the
+//! `pinned-engine` feature flag at compile time. Linux is the
+//! best-supported target — pinning sharply reduces p99.99 / max
+//! tail latency under load by removing scheduler preemption.
+//! macOS treats the affinity hint as a soft QoS bias; the
+//! observable delta is smaller. Without the flag (or without the
+//! feature), the engine thread runs on the OS-default scheduler.
 //!
 //! ## Backpressure
 //!
@@ -39,8 +49,17 @@ const INBOUND_CHANNEL_CAPACITY: usize = 8192;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let addr = args.get(1).cloned().unwrap_or_else(|| DEFAULT_ADDR.into());
+    let addr = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_ADDR.into());
+    let engine_core = parse_engine_core(&args);
     eprintln!("engine: binding gateway listener on {addr}");
+    if let Some(core) = engine_core {
+        eprintln!("engine: requested CPU pinning to core {core}");
+    }
 
     // Async → sync bridge: the gateway runs on tokio and produces
     // typed `Inbound`. The engine is sync. We bridge with a sync
@@ -66,7 +85,10 @@ async fn main() -> std::io::Result<()> {
     // Engine thread.
     thread::Builder::new()
         .name("engine".into())
-        .spawn(move || engine_loop(sync_rx, sink))
+        .spawn(move || {
+            pin_to_core(engine_core);
+            engine_loop(sync_rx, sink);
+        })
         .expect("engine thread spawn");
 
     // Listener loop. Returns on listener error.
@@ -75,6 +97,55 @@ async fn main() -> std::io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// Parse `--engine-core <N>` from `args`. Returns `None` when the
+/// flag is absent or the value is malformed (silently — pinning is
+/// a soft optimisation; an invalid argument should not fail boot).
+fn parse_engine_core(args: &[String]) -> Option<usize> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--engine-core" {
+            return iter.next().and_then(|v| v.parse::<usize>().ok());
+        }
+    }
+    None
+}
+
+#[cfg(feature = "pinned-engine")]
+fn pin_to_core(core: Option<usize>) {
+    let Some(core_idx) = core else {
+        return;
+    };
+    match core_affinity::get_core_ids() {
+        Some(ids) => match ids.get(core_idx) {
+            Some(id) => {
+                if core_affinity::set_for_current(*id) {
+                    eprintln!("engine: pinned thread to core {core_idx}");
+                } else {
+                    eprintln!("engine: pin to core {core_idx} failed (continuing unpinned)");
+                }
+            }
+            None => {
+                eprintln!(
+                    "engine: requested core {core_idx} out of range (have {} cores)",
+                    ids.len()
+                );
+            }
+        },
+        None => {
+            eprintln!("engine: core_affinity::get_core_ids() returned None — cannot pin");
+        }
+    }
+}
+
+#[cfg(not(feature = "pinned-engine"))]
+fn pin_to_core(core: Option<usize>) {
+    if core.is_some() {
+        eprintln!(
+            "engine: --engine-core requested but binary not built with `--features pinned-engine`"
+        );
+    }
 }
 
 fn engine_loop(rx: mpsc::Receiver<Inbound>, sink: ChannelSink) {
