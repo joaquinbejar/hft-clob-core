@@ -327,15 +327,30 @@ impl Book {
             // sides and halts the walk. Otherwise the head is filled
             // (partial or full) via `update_order` and the next head
             // becomes the new front.
+            //
+            // Pricelevel's `iter_orders()` walks the underlying
+            // `DashMap` and is hash-ordered — explicitly documented as
+            // "iteration order is not guaranteed to be stable". We
+            // need strict FIFO for price-time priority, so we use
+            // `snapshot_orders()` which returns a Vec sorted by the
+            // per-add timestamp we wrote in `add_resting` (the
+            // monotonic `self.seq` counter). Order objects in the
+            // snapshot stay valid for id + qty reads even if the
+            // level mutates underneath us — full-fill drops the
+            // order, partial-fill replaces it under the same id, and
+            // the snapshot index advances on each consumed head.
+            //
+            // Allocates one `Vec<Arc<_>>` per level entry. Acceptable
+            // for v1; a follow-up (#10/issue-bench) can lift this
+            // into a Book-side `VecDeque<OrderId>` mirror to land at
+            // zero alloc on the fill loop.
+            let head_snapshot = level_arc.snapshot_orders();
+            let mut snap_idx = 0usize;
             'level: loop {
                 if remaining == 0 {
                     break 'level;
                 }
-                // Peek the queue head. `iter_orders` is FIFO under
-                // single-writer (the matching core is single-writer
-                // per CLAUDE.md), so the first item is the oldest
-                // resting order at this price.
-                let head = match level_arc.iter_orders().next() {
+                let head = match head_snapshot.get(snap_idx) {
                     Some(h) => h,
                     None => break 'level,
                 };
@@ -395,11 +410,16 @@ impl Book {
                         order_id: head_pl_id,
                     });
                     self.drop_from_indices(head_order_id);
+                    snap_idx += 1;
                 } else {
                     let _ = level_arc.update_order(PlOrderUpdate::UpdateQuantity {
                         order_id: head_pl_id,
                         new_quantity: PlQuantity::new(new_head_qty_raw),
                     });
+                    // Partial fill: head stays at the front of the
+                    // FIFO queue with reduced qty. Caller's `remaining`
+                    // is now 0 so the next loop iteration exits via
+                    // the `if remaining == 0` guard at the top.
                 }
 
                 let Ok(fill_qty) = Qty::new(fill_qty_raw) else {
