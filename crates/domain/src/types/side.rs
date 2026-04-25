@@ -4,7 +4,7 @@ use std::fmt;
 
 /// Order side. Wire-stable: numeric discriminants are part of the
 /// public contract and must not be reassigned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Side {
     /// Buy side.

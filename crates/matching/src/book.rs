@@ -637,6 +637,21 @@ impl Book {
         self.asks.keys().next().copied()
     }
 
+    /// Aggregate qty at a single level on the given side. Returns 0
+    /// when the level is empty (or the underlying pricelevel has not
+    /// yet been pruned). O(log n) on the BTreeMap.
+    #[must_use]
+    pub fn qty_at_level(&self, side: Side, price: Price) -> u64 {
+        let levels = match side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+        levels
+            .get(&price)
+            .map(|level| level.total_quantity().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     /// Iterate the bid side as `(price, total_qty)` pairs in **best-first**
     /// (descending price) order. Drives deterministic snapshot
     /// emission — the underlying `BTreeMap` already iterates in sorted
