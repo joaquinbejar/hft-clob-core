@@ -56,6 +56,7 @@ USER engine
 # Copy the produced binaries plus the replay fixtures.
 COPY --from=builder --chown=engine:engine /work/target/release/engine /app/engine
 COPY --from=builder --chown=engine:engine /work/target/release/smoke_bench /app/smoke_bench
+COPY --from=builder --chown=engine:engine /work/target/release/throughput_bench /app/throughput_bench
 COPY --from=builder --chown=engine:engine /work/target/release/replay /app/replay
 COPY --from=builder --chown=engine:engine /work/fixtures /app/fixtures
 

@@ -44,3 +44,12 @@ services:
       - "/tmp/out.bin"
       - "--no-timestamps"
     profiles: ["bench"]
+
+  throughput:
+    image: hft-clob-core:dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: hft-clob-throughput
+    entrypoint: ["/app/throughput_bench"]
+    profiles: ["bench"]

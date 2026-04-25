@@ -195,6 +195,11 @@ smoke-bench:
 dhat:
 	cargo run --release --features hotpath-dhat --bin dhat_bench
 
+# Sustained burst throughput — 1M ops, prints ops/sec.
+.PHONY: throughput
+throughput:
+	cargo run --release --bin throughput_bench
+
 # Full bench (Criterion, default budget). Allow ~18 min wall-clock.
 .PHONY: bench-full
 bench-full:
