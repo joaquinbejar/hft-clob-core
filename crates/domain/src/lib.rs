@@ -22,9 +22,11 @@
 
 pub mod consts;
 pub mod error;
+pub mod traits;
 pub mod types;
 
 pub use error::DomainError;
+pub use traits::{Clock, IdGenerator};
 pub use types::{
     AccountId, AccountIdError, CancelReason, CancelReasonError, ClientTs, EngineSeq,
     EngineSeqError, ExecState, ExecStateError, OrderId, OrderIdError, OrderType, OrderTypeError,

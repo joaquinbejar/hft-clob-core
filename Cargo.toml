@@ -59,6 +59,7 @@ hdrhistogram      = "7.5"
 criterion         = { version = "0.8", default-features = false, features = ["html_reports"] }
 proptest          = "1.11"
 zerocopy          = { version = "0.8", features = ["derive"] }
+uuid              = "1"
 
 [profile.release]
 opt-level     = 3
