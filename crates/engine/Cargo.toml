@@ -40,6 +40,9 @@ pinned-engine = ["dep:core_affinity"]
 [dev-dependencies]
 proptest.workspace = true
 criterion = { workspace = true, features = ["html_reports"] }
+clob-client = { workspace = true }
+gateway = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "io-util", "net", "time"] }
 
 [[bench]]
 name = "add_cancel_mix"

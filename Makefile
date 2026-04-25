@@ -49,6 +49,9 @@ help:
 	@echo "  docker-bench       docker compose run --rm bench"
 	@echo "  docker-replay      docker compose run --rm replay"
 	@echo "  docker-down        docker compose down"
+	@echo "  smoke-test         build image + run every localhost example, tear down"
+	@echo "  smoke-test-external  same, but reuse an externally-running engine"
+	@echo "  examples           build the localhost examples (release)"
 	@echo ""
 	@echo "Coverage / docs / misc:"
 	@echo "  coverage           tarpaulin XML"
@@ -244,6 +247,24 @@ docker-replay:
 .PHONY: docker-down
 docker-down:
 	docker compose -f docker/docker-compose.yml down
+
+# End-to-end smoke test: build docker image, launch engine, run every
+# localhost example against the running container, tear down. Always
+# cleans up on exit. Writes smoke-results.json for CI consumption.
+.PHONY: smoke-test
+smoke-test:
+	./scripts/smoke-test.sh
+
+# Skip docker compose orchestration — assume an engine is already
+# running externally on $CLOB_ENGINE_ADDR.
+.PHONY: smoke-test-external
+smoke-test-external:
+	SMOKE_USE_EXTERNAL_DEPS=1 ./scripts/smoke-test.sh
+
+# Build the localhost examples in release without running any.
+.PHONY: examples
+examples:
+	cargo build --release --examples -p clob-client
 
 # End-to-end smoke: full gate + replay golden + smoke bench.
 # Use this before opening a PR.
