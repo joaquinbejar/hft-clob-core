@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Single-writer matching core.
 //!
 //! The hot path of the system. Consumes orders that have passed risk validation,
@@ -13,3 +15,11 @@
 //! - `engine_seq` is strictly monotonic across all outbound events.
 //!   Checked arithmetic on every increment.
 //! - No tokio, no async. Pure blocking single-writer thread.
+
+/// Book data structure and operations.
+pub mod book;
+/// Error types.
+pub mod error;
+
+pub use book::{Book, RestingOrder};
+pub use error::BookError;
