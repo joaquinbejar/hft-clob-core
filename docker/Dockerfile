@@ -45,6 +45,17 @@ RUN cargo build --release --workspace --bins
 
 # ---------- runtime: alpine + binaries -----------------------------------
 FROM ${ALPINE_IMAGE} AS runtime
+
+# OCI image annotations — GHCR auto-links the package to the repo
+# from `org.opencontainers.image.source` and surfaces title /
+# description / licenses on the package page.
+LABEL org.opencontainers.image.title="hft-clob-core"
+LABEL org.opencontainers.image.description="Single-symbol CLOB matching engine in Rust — integer-only hot path, deterministic replay, microsecond-class tail latency."
+LABEL org.opencontainers.image.source="https://github.com/joaquinbejar/hft-clob-core"
+LABEL org.opencontainers.image.url="https://github.com/joaquinbejar/hft-clob-core"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.vendor="joaquinbejar"
+
 RUN apk add --no-cache ca-certificates && \
     addgroup -g 1000 engine && \
     adduser -u 1000 -G engine -s /bin/sh -D engine
