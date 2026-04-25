@@ -8,6 +8,7 @@ members = [
   "crates/marketdata",
   "crates/engine",
   "crates/wire",
+  "crates/clob-client",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ gateway    = { path = "crates/gateway",    version = "0.1.0" }
 marketdata = { path = "crates/marketdata", version = "0.1.0" }
 engine     = { path = "crates/engine",     version = "0.1.0" }
 wire       = { path = "crates/wire",       version = "0.1.0" }
+clob-client = { path = "crates/clob-client", version = "0.1.0" }
 
 # External local crates — sibling repos, path deps. See CLAUDE.md for relaxations
 # that cover dashmap / uuid / ulid / atomics introduced by these libs.

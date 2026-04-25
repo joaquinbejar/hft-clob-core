@@ -8,11 +8,14 @@
 # path dependencies, so the build context only needs the workspace
 # itself — no sibling-repo COPY required.
 
-ARG RUST_VERSION=1.95
 ARG DEBIAN_VERSION=bookworm-slim
 
 # ---------- builder stage --------------------------------------------------
-FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+# Use the latest stable rust slim image so the build does not depend on
+# a specific minor version being mirrored. `rust-toolchain.toml` pins
+# the channel to `stable`, so this image will always satisfy the
+# workspace's MSRV.
+FROM rust:slim-bookworm AS builder
 WORKDIR /work
 
 # System deps for the rust toolchain. `pkg-config` + `libssl-dev` cover
@@ -57,7 +60,9 @@ USER engine
 COPY --from=builder --chown=engine:engine /work/target/release/engine /app/engine
 COPY --from=builder --chown=engine:engine /work/target/release/smoke_bench /app/smoke_bench
 COPY --from=builder --chown=engine:engine /work/target/release/throughput_bench /app/throughput_bench
+COPY --from=builder --chown=engine:engine /work/target/release/co_bench /app/co_bench
 COPY --from=builder --chown=engine:engine /work/target/release/replay /app/replay
+COPY --from=builder --chown=engine:engine /work/target/release/gen_fixture /app/gen_fixture
 COPY --from=builder --chown=engine:engine /work/fixtures /app/fixtures
 
 EXPOSE 9000

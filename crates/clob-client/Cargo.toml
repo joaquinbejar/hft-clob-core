@@ -1,0 +1,70 @@
+[package]
+name = "clob-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+autoexamples = false
+
+[dependencies]
+domain = { workspace = true }
+wire = { workspace = true }
+marketdata = { workspace = true }
+tokio = { workspace = true, features = ["rt", "io-util", "net", "macros", "time"] }
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[[example]]
+name = "localhost_new_order_gtc_rests"
+path = "examples/localhost_new_order_gtc_rests.rs"
+
+[[example]]
+name = "localhost_new_order_gtc_crosses"
+path = "examples/localhost_new_order_gtc_crosses.rs"
+
+[[example]]
+name = "localhost_new_order_ioc_partial"
+path = "examples/localhost_new_order_ioc_partial.rs"
+
+[[example]]
+name = "localhost_post_only_would_cross"
+path = "examples/localhost_post_only_would_cross.rs"
+
+[[example]]
+name = "localhost_cancel_order"
+path = "examples/localhost_cancel_order.rs"
+
+[[example]]
+name = "localhost_cancel_replace_keeps_priority"
+path = "examples/localhost_cancel_replace_keeps_priority.rs"
+
+[[example]]
+name = "localhost_mass_cancel"
+path = "examples/localhost_mass_cancel.rs"
+
+[[example]]
+name = "localhost_kill_switch"
+path = "examples/localhost_kill_switch.rs"
+
+[[example]]
+name = "localhost_snapshot_request"
+path = "examples/localhost_snapshot_request.rs"
+
+[[example]]
+name = "localhost_market_in_empty_book"
+path = "examples/localhost_market_in_empty_book.rs"
+
+[[example]]
+name = "localhost_engine_seq_monotonic"
+path = "examples/localhost_engine_seq_monotonic.rs"
+
+[[example]]
+name = "localhost_duplicate_order_id"
+path = "examples/localhost_duplicate_order_id.rs"
