@@ -11,9 +11,8 @@ repository.workspace = true
 
 [dependencies]
 domain = { workspace = true }
-ironsbe-core = { workspace = true }
-ironsbe-derive = { workspace = true }
-bytes.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
