@@ -279,20 +279,16 @@ impl Book {
 
             let mut filled_cursor: usize = 0;
             for trade in trades_slice.iter() {
-                let trade_id = ids.next_trade_id();
                 let maker_pl_id = trade.maker_order_id();
+                let q = trade.quantity().as_u64();
+                // Pricelevel must emit only non-zero qty trades. Validate
+                // before allocating a trade_id; invalid qty halts the walk.
+                let Ok(qty) = Qty::new(q) else {
+                    debug_assert!(false, "pricelevel emitted zero-qty trade");
+                    break;
+                };
+                let trade_id = ids.next_trade_id();
                 let maker_order_id = pl_id_to_domain(maker_pl_id);
-                // Pricelevel emits trades only when at least one lot
-                // crossed, so `quantity()` is always `>= 1`. Falling
-                // back to `Qty::MIN` (one lot) on the impossible
-                // zero-qty path keeps the conservation invariant
-                // honest rather than masking a violated qty as the
-                // taker's full size.
-                let qty = Qty::new(trade.quantity().as_u64()).unwrap_or(Qty::MIN);
-                debug_assert!(
-                    trade.quantity().as_u64() > 0,
-                    "pricelevel must not emit zero-qty trades"
-                );
 
                 // Maker is fully filled iff it's the next one in the
                 // pricelevel-ordered `filled` slice.
@@ -346,7 +342,7 @@ impl Book {
 
         MatchResult {
             fills_count: out_buf.len() - initial_buf_len,
-            taker_remaining: remaining,
+            taker_remaining: Qty::new(remaining).ok(),
         }
     }
 
@@ -405,18 +401,12 @@ fn domain_to_pl_side(side: Side) -> PlSide {
 
 #[inline]
 fn pl_id_to_domain(id: PlId) -> OrderId {
-    // Every order this crate inserts uses `PlId::Sequential(u64)`;
-    // any other variant would mean pricelevel handed us back an id we
-    // never produced. Defensive zero -> a sentinel `OrderId::new(1)`
-    // so this stays panic-free.
+    // Every order this crate inserts uses `PlId::Sequential(raw)` where
+    // raw > 0. Pricelevel must return only these ids in the trades it
+    // emits — anything else would indicate a corrupted exchange state.
     match id {
-        PlId::Sequential(raw) => OrderId::new(raw).unwrap_or_else(|_| {
-            // raw == 0 would mean pricelevel synthesised an id; we
-            // never insert with raw == 0 (domain rejects it). Map to
-            // a deterministic sentinel rather than panic.
-            OrderId::new(1).expect("OrderId::new(1) is valid")
-        }),
-        _ => OrderId::new(1).expect("OrderId::new(1) is valid"),
+        PlId::Sequential(raw) => OrderId::new(raw).expect("pricelevel must emit valid OrderIds"),
+        _ => panic!("pricelevel returned unknown id variant"),
     }
 }
 
@@ -661,7 +651,7 @@ mod tests {
         let mut buf = Vec::new();
         let r = book.match_aggressive(taker(1, Side::Bid, Some(100), 10), &mut ids, &mut buf);
         assert_eq!(r.fills_count, 0);
-        assert_eq!(r.taker_remaining, 10);
+        assert_eq!(r.taker_remaining, Some(Qty::new(10).expect("ok")));
         assert!(buf.is_empty());
     }
 
@@ -673,7 +663,7 @@ mod tests {
         let mut buf = Vec::new();
         let r = book.match_aggressive(taker(2, Side::Bid, Some(100), 10), &mut ids, &mut buf);
         assert_eq!(r.fills_count, 1);
-        assert_eq!(r.taker_remaining, 0);
+        assert_eq!(r.taker_remaining, None);
         assert_eq!(buf.len(), 1);
         assert_eq!(buf[0].qty, Qty::new(10).expect("ok"));
         assert_eq!(buf[0].price, Price::new(100).expect("ok"));
@@ -695,7 +685,7 @@ mod tests {
         // Taker wants 10 but only 5 resting at any crossing price.
         let r = book.match_aggressive(taker(2, Side::Bid, Some(100), 10), &mut ids, &mut buf);
         assert_eq!(r.fills_count, 1);
-        assert_eq!(r.taker_remaining, 5);
+        assert_eq!(r.taker_remaining, Some(Qty::new(5).expect("ok")));
         assert_eq!(buf[0].qty, Qty::new(5).expect("ok"));
     }
 
@@ -710,7 +700,7 @@ mod tests {
         let mut buf = Vec::new();
         let r = book.match_aggressive(taker(3, Side::Bid, Some(110), 8), &mut ids, &mut buf);
         assert_eq!(r.fills_count, 2);
-        assert_eq!(r.taker_remaining, 0);
+        assert_eq!(r.taker_remaining, None);
         // First fill at the better (lower) ask price.
         assert_eq!(buf[0].price, Price::new(100).expect("ok"));
         assert_eq!(buf[0].qty, Qty::new(5).expect("ok"));
@@ -732,7 +722,7 @@ mod tests {
         // Taker price 100 only crosses the 100 level, not 105.
         let r = book.match_aggressive(taker(3, Side::Bid, Some(100), 10), &mut ids, &mut buf);
         assert_eq!(r.fills_count, 1);
-        assert_eq!(r.taker_remaining, 5);
+        assert_eq!(r.taker_remaining, Some(Qty::new(5).expect("ok")));
         assert_eq!(buf[0].price, Price::new(100).expect("ok"));
         // 105 level untouched.
         assert_eq!(book.side_qty(Side::Ask), 5);
@@ -749,7 +739,7 @@ mod tests {
         // None price = market order; sweeps until book empty or filled.
         let r = book.match_aggressive(taker(4, Side::Bid, None, 100), &mut ids, &mut buf);
         assert_eq!(r.fills_count, 3);
-        assert_eq!(r.taker_remaining, 91); // 100 - 9 filled
+        assert_eq!(r.taker_remaining, Some(Qty::new(91).expect("ok"))); // 100 - 9 filled
         assert!(book.best_ask().is_none());
     }
 
@@ -788,7 +778,7 @@ mod tests {
         let mut buf = Vec::new();
         let r = book.match_aggressive(taker(3, Side::Bid, Some(100), 10), &mut ids, &mut buf);
         assert_eq!(r.fills_count, 2);
-        assert_eq!(r.taker_remaining, 0);
+        assert_eq!(r.taker_remaining, None);
         // Both makers fully filled — sidecar should not retain them;
         // a follow-up cancel must return UnknownOrderId.
         assert_eq!(
@@ -822,9 +812,13 @@ mod tests {
             ask_levels in prop::collection::vec((1i64..=100, 1u64..=100u64), 1..=10usize),
             taker_qty in 1u64..=1_000u64,
         ) {
+            use std::collections::HashMap;
             let mut book = Book::new();
+            let mut maker_prices: HashMap<u64, i64> = HashMap::new();
             for (i, (price, qty)) in ask_levels.iter().enumerate() {
-                let _ = book.add_resting(order((i as u64) + 1, Side::Ask, *price, *qty));
+                let oid = (i as u64) + 1;
+                maker_prices.insert(oid, *price);
+                let _ = book.add_resting(order(oid, Side::Ask, *price, *qty));
             }
             let mut ids = MockIds::new();
             let mut buf = Vec::new();
@@ -833,12 +827,11 @@ mod tests {
                 &mut ids,
                 &mut buf,
             );
-            // Every fill's price MUST equal the maker's resting level
-            // price. We don't need to know the maker's pre-trade qty —
-            // the check is structural.
             for fill in &buf {
-                prop_assert_eq!(fill.price, fill.price); // tautology — kept for clarity
-                prop_assert_eq!(fill.maker_order_id != fill.taker_order_id, true);
+                let expected_price =
+                    maker_prices.get(&fill.maker_order_id.as_raw()).copied();
+                prop_assert_eq!(Some(fill.price), expected_price.map(|p| Price::new(p).expect("ok")));
+                prop_assert_ne!(fill.maker_order_id, fill.taker_order_id);
                 prop_assert_eq!(fill.maker_side, Side::Ask);
             }
         }

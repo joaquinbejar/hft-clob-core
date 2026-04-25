@@ -59,15 +59,15 @@ pub struct Fill {
 /// `fills_count` is the number of [`Fill`] entries the call **wrote
 /// into the caller's `out_buf`**, starting at the buffer's existing
 /// length. `taker_remaining` is the leftover qty after the walk:
-/// `0` means the taker was fully consumed (terminal `Filled` from the
-/// engine's perspective); a non-zero value lets the engine apply TIF
-/// semantics (rest as `Gtc`, cancel for `Ioc`, etc.) — that policy
-/// lives in issue #8.
+/// `None` means the taker was fully consumed (terminal `Filled` from the
+/// engine's perspective). `Some(qty)` is a non-zero qty that lets the
+/// engine apply TIF semantics (rest as `Gtc`, cancel for `Ioc`, etc.) —
+/// that policy lives in issue #8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchResult {
     /// Number of fills appended to the caller's `out_buf`.
     pub fills_count: usize,
-    /// Taker's remaining qty after the walk, in lots. `0` =
-    /// fully consumed.
-    pub taker_remaining: u64,
+    /// Taker's remaining qty after the walk. `None` = fully consumed;
+    /// `Some(qty)` where qty > 0 for partial consumption.
+    pub taker_remaining: Option<Qty>,
 }
