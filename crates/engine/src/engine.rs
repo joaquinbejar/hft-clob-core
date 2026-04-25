@@ -121,6 +121,15 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
         &mut self.sink
     }
 
+    /// Read-only accessor for the embedded clock. The replay harness
+    /// uses this to call `StubClock::set(...)` between inbound
+    /// records — the trait is `&self`-only by design so the engine
+    /// thread does not have to drop its lock to advance the clock.
+    #[must_use]
+    pub fn clock(&self) -> &C {
+        &self.clock
+    }
+
     /// Drive one inbound command through the full pipeline.
     pub fn step(&mut self, inbound: Inbound) {
         let recv_ts = self.clock.now();
