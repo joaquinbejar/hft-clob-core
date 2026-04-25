@@ -39,7 +39,7 @@ fmt:
 fmt-check:
 	cargo fmt --all --check
 
-# Run Clippy for linting. `-D warnings` is the CLAUDE.md bar.
+# Run Clippy for linting. `-D warnings` is the project bar.
 .PHONY: lint
 lint:
 	cargo clippy --all-targets -- -D warnings
@@ -53,7 +53,7 @@ lint-fix:
 clean:
 	cargo clean
 
-# Pre-commit / CI gate per CLAUDE.md: fmt-check + clippy + nextest + release.
+# Pre-commit / CI gate: fmt-check + clippy + nextest + release.
 .PHONY: check
 check: fmt-check lint test release
 
