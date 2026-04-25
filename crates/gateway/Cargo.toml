@@ -12,7 +12,8 @@ repository.workspace = true
 [dependencies]
 domain = { workspace = true }
 wire = { workspace = true }
-tokio = { workspace = true, features = ["rt", "io-util", "net", "macros", "time"] }
+marketdata = { workspace = true }
+tokio = { workspace = true, features = ["rt", "io-util", "net", "macros", "time", "sync"] }
 ironsbe-transport = { workspace = true }
 ironsbe-server = { workspace = true }
 ironsbe-channel = { workspace = true }
@@ -22,3 +23,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+engine = { workspace = true }
+risk = { workspace = true }
+matching = { workspace = true }

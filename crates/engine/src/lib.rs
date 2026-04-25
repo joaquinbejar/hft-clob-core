@@ -24,10 +24,8 @@ pub mod engine;
 /// `IdGenerator` implementations — monotonic counters for trade ids
 /// and engine sequence numbers.
 pub mod ids;
-/// `OutboundSink` trait + in-memory `VecSink` for tests / replay.
-pub mod sink;
 
 pub use clock::{StubClock, WallClock};
 pub use engine::Engine;
 pub use ids::CounterIdGenerator;
-pub use sink::{OutboundSink, VecSink};
+pub use marketdata::{OutboundSink, VecSink};
