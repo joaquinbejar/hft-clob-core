@@ -69,6 +69,47 @@ microstructure cost model (matching is dominated by the
 `snapshot_orders()` allocation per level entry, which is the next
 target — see "Where the tail comes from" below).
 
+## Sustained throughput
+
+The Criterion bench reports per-op tail latency. The spec also asks
+for sustained throughput under a 1M-order burst as a separate
+headline number — that signal is what one engine core can absorb
+under the documented mix without queuing.
+
+`crates/engine/src/bin/throughput_bench.rs` runs the same
+`add_cancel_mix` workload (70 / 20 / 10 add / cancel / aggressive,
+deterministic LCG seed) for `N_WARMUP = 100_000` warmup ops + a
+contiguous `N_MEASURE = 1_000_000` measurement burst on a single
+thread. Throughput is `N_MEASURE / measure_wall_clock`.
+
+### Captured numbers (Apple M4 Max, release build)
+
+| Metric | Value |
+|--------|------:|
+| Warmup ops | 100,000 |
+| Measurement ops | 1,000,000 |
+| Warmup wall-clock | 7 ms |
+| Measurement wall-clock | 655 ms |
+| **Sustained throughput** | **~1.53 M ops/sec** |
+
+### Reproducing
+
+```bash
+cargo run --release --bin throughput_bench
+```
+
+### Interpretation
+
+The 1.53 M ops/sec ceiling is bounded by the same per-level
+`snapshot_orders()` allocation that drives the p99.9 percentile
+in the Criterion table (~210 µs). The ~25 % of ops that take an
+aggressive path through the fill loop pay one Vec allocation +
+N atomic refcount bumps per level entered, which is what the
+allocator pause tail captures. The Book-side `VecDeque<OrderId>`
+mirror evolution should lift this number into the 3–5 M ops/sec
+neighborhood without any change to the matching policy or
+outbound contract.
+
 ## Where the tail comes from
 
 - **p50 (≈ 40 ns)** — the hot path is dominated by the inner
