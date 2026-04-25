@@ -86,6 +86,36 @@ pub struct StpCancellation {
     pub qty: Qty,
 }
 
+/// One mass-cancel emission. The fill loop's mass-cancel path
+/// produces one record per resting order it dropped for the target
+/// account; the engine pipeline emits a `Cancelled{MassCancel}`
+/// exec report carrying each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MassCancellation {
+    /// Resting order id that was dropped.
+    pub order_id: OrderId,
+    /// Account that owns the order (always the mass-cancel target).
+    pub account_id: AccountId,
+    /// Resting side.
+    pub side: Side,
+    /// Resting price.
+    pub price: Price,
+    /// Residual qty at the time of cancellation.
+    pub qty: Qty,
+}
+
+/// Outcome of [`crate::Book::replace`]. Kept lightweight so the engine
+/// can fold it into the right exec-report shape (`Replaced{kept_priority}`)
+/// without re-deriving facts the matching core already knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplaceOutcome {
+    /// `true` when the order kept its FIFO position (qty-down,
+    /// in-place via `pricelevel::UpdateQuantity`). `false` when the
+    /// order was cancel-and-re-added at the new (price, qty) — any
+    /// price change or qty-up loses priority.
+    pub kept_priority: bool,
+}
+
 /// Summary of one [`crate::Book::match_aggressive`] call.
 ///
 /// `fills_count` is the number of [`Fill`] entries the call **wrote
@@ -111,4 +141,10 @@ pub struct MatchResult {
     /// `SelfTradePrevented` regardless of TIF, taking precedence
     /// over `Gtc` / `Ioc` resting policy.
     pub taker_stp_cancelled: bool,
+    /// `true` when the taker's TIF was `PostOnly` and the order
+    /// would have crossed at arrival. The walk performs zero fills,
+    /// zero STP cancels, and zero level mutations — the engine
+    /// pipeline emits `Rejected{PostOnlyWouldCross}` for the taker
+    /// and the book is unchanged.
+    pub taker_post_only_rejected: bool,
 }

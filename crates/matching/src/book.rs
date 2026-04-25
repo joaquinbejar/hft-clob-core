@@ -7,17 +7,19 @@
 //! tracking; iteration order on the sidecar is never observable from
 //! this crate's outputs (CLAUDE.md § Architecture).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use domain::{AccountId, IdGenerator, OrderId, Price, Qty, Side};
+use domain::{AccountId, IdGenerator, OrderId, Price, Qty, Side, Tif};
 use pricelevel::{
     Hash32, Id as PlId, OrderType as PlOrderType, OrderUpdate as PlOrderUpdate, Price as PlPrice,
     PriceLevel, Quantity as PlQuantity, Side as PlSide, TimeInForce as PlTif, TimestampMs,
 };
 
 use crate::error::BookError;
-use crate::fill::{AggressiveOrder, Fill, MatchResult, StpCancellation};
+use crate::fill::{
+    AggressiveOrder, Fill, MassCancellation, MatchResult, ReplaceOutcome, StpCancellation,
+};
 
 /// Sidecar entry per resting order: every field the cancel /
 /// match-walk paths read in O(1) without iterating the price index.
@@ -62,6 +64,12 @@ pub struct Book {
     /// cancel is O(log n) on the price index plus O(1) inside the
     /// level, and STP detection inside the fill loop is also O(1).
     index: HashMap<OrderId, OrderMeta>,
+    /// Per-account secondary index for mass-cancel. The outer
+    /// `HashMap` is point-lookup only — never iterated into outputs.
+    /// The inner `BTreeSet<OrderId>` is iterated in sorted order so
+    /// the mass-cancel emission stream is deterministic across runs
+    /// (CLAUDE.md "no unordered iteration into outputs").
+    by_account: HashMap<AccountId, BTreeSet<OrderId>>,
     /// Strictly increasing per-order arrival counter, used as the
     /// `pricelevel::TimestampMs` for each inserted order. Internal
     /// monotonic — does NOT read the wall clock. CLAUDE.md forbids
@@ -77,6 +85,7 @@ impl Book {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             index: HashMap::new(),
+            by_account: HashMap::new(),
             seq: 0,
         }
     }
@@ -140,7 +149,33 @@ impl Book {
                 account_id: order.account_id,
             },
         );
+        self.by_account
+            .entry(order.account_id)
+            .or_default()
+            .insert(order.order_id);
         Ok(())
+    }
+
+    /// Drop `order_id` from both the primary sidecar and the
+    /// per-account secondary index, prunning the per-account entry
+    /// when its set goes empty. Called from every place that removes
+    /// a resting order (explicit cancel, full fill, STP cancel,
+    /// mass-cancel, cancel-replace lose-priority path).
+    #[inline]
+    fn drop_from_indices(&mut self, order_id: OrderId) {
+        if let Some(meta) = self.index.remove(&order_id) {
+            let now_empty = self
+                .by_account
+                .get_mut(&meta.account_id)
+                .map(|set| {
+                    set.remove(&order_id);
+                    set.is_empty()
+                })
+                .unwrap_or(false);
+            if now_empty {
+                self.by_account.remove(&meta.account_id);
+            }
+        }
     }
 
     /// Cancel a resting order by id. Removes the level from the
@@ -163,24 +198,27 @@ impl Book {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
-        let level = levels.get(&price).ok_or(BookError::UnknownOrderId)?;
-        // TODO(#12): `update_order` returns the cancelled order record
-        // so the engine pipeline can emit a `Cancelled{reason}` exec
-        // report carrying the `leaves_qty`. Allocator behaviour of the
-        // discard path needs revisiting when that wiring lands — if
-        // the inner `Option<Arc<…>>` boxes per call, swap to a
-        // `remove_by_id`-shaped path.
-        let _ = level.update_order(PlOrderUpdate::Cancel {
-            order_id: PlId::Sequential(order_id.as_raw()),
-        });
-        let level_empty = level.order_count() == 0;
-
-        // Pricelevel cancel is observable; only now is it safe to
-        // mutate the sidecar and prune an empty level.
-        self.index.remove(&order_id);
+        let level_empty = {
+            let level = levels.get(&price).ok_or(BookError::UnknownOrderId)?;
+            // TODO(#12): `update_order` returns the cancelled order
+            // record so the engine pipeline can emit a
+            // `Cancelled{reason}` exec report carrying the
+            // `leaves_qty`. Allocator behaviour of the discard path
+            // needs revisiting when that wiring lands — if the inner
+            // `Option<Arc<…>>` boxes per call, swap to a
+            // `remove_by_id`-shaped path.
+            let _ = level.update_order(PlOrderUpdate::Cancel {
+                order_id: PlId::Sequential(order_id.as_raw()),
+            });
+            level.order_count() == 0
+        };
         if level_empty {
             levels.remove(&price);
         }
+        // `levels` (a borrow of `self.bids` / `self.asks`) goes out
+        // of scope here, freeing `self` so the helper can mutate the
+        // sidecar and per-account index.
+        self.drop_from_indices(order_id);
         Ok((side, price))
     }
 
@@ -237,6 +275,19 @@ impl Book {
         let initial_stp_len = out_stp.len();
         let mut remaining = taker.qty.as_lots();
         let mut taker_stp_cancelled = false;
+
+        // Post-only would-cross gate — fires before any state mutation.
+        // The order is rejected outright if it would cross the
+        // opposite side at arrival, regardless of size.
+        if taker.tif == Tif::PostOnly && self.would_cross(taker.side, taker.price) {
+            return MatchResult {
+                fills_count: 0,
+                stp_cancellations: 0,
+                taker_remaining: Some(taker.qty),
+                taker_stp_cancelled: false,
+                taker_post_only_rejected: true,
+            };
+        }
 
         'walk: while remaining > 0 {
             // Pick the best opposite-side level price.
@@ -307,7 +358,7 @@ impl Book {
                     let _ = level_arc.update_order(PlOrderUpdate::Cancel {
                         order_id: head_pl_id,
                     });
-                    self.index.remove(&head_order_id);
+                    self.drop_from_indices(head_order_id);
                     out_stp.push(StpCancellation {
                         order_id: head_order_id,
                         account_id: head_meta.account_id,
@@ -343,7 +394,7 @@ impl Book {
                     let _ = level_arc.update_order(PlOrderUpdate::Cancel {
                         order_id: head_pl_id,
                     });
-                    self.index.remove(&head_order_id);
+                    self.drop_from_indices(head_order_id);
                 } else {
                     let _ = level_arc.update_order(PlOrderUpdate::UpdateQuantity {
                         order_id: head_pl_id,
@@ -383,7 +434,173 @@ impl Book {
             stp_cancellations: out_stp.len() - initial_stp_len,
             taker_remaining: Qty::new(remaining).ok(),
             taker_stp_cancelled,
+            taker_post_only_rejected: false,
         }
+    }
+
+    /// Returns `true` when an order with the given side and price
+    /// would immediately cross the resting book. Market orders
+    /// (`taker_price == None`) cross unconditionally if the
+    /// opposite side has any resting qty. Used by the `PostOnly`
+    /// arrival gate (#10) and the engine pipeline's pre-trade
+    /// would-cross checks.
+    #[inline]
+    fn would_cross(&self, taker_side: Side, taker_price: Option<Price>) -> bool {
+        let best_opp = match taker_side {
+            Side::Bid => self.best_ask(),
+            Side::Ask => self.best_bid(),
+        };
+        match (taker_price, best_opp) {
+            (None, Some(_)) => true,
+            (None, None) => false,
+            (Some(_), None) => false,
+            (Some(p), Some(opp)) => match taker_side {
+                Side::Bid => p >= opp,
+                Side::Ask => p <= opp,
+            },
+        }
+    }
+
+    /// Cancel-and-replace a resting order. Priority is preserved
+    /// only on a strict qty-down with no price change; any price
+    /// change or qty-up loses priority (cancel + re-add at the new
+    /// `(price, qty)`). Returns a [`ReplaceOutcome`] carrying
+    /// `kept_priority` so the engine pipeline can stamp the
+    /// `Replaced{kept_priority}` exec report correctly.
+    ///
+    /// # Errors
+    /// - [`BookError::UnknownOrderId`] when `order_id` is not present.
+    /// - [`BookError::SeqOverflow`] on the cancel-and-readd path
+    ///   when the internal arrival counter would overflow.
+    pub fn replace(
+        &mut self,
+        order_id: OrderId,
+        new_price: Price,
+        new_qty: Qty,
+    ) -> Result<ReplaceOutcome, BookError> {
+        let meta = *self.index.get(&order_id).ok_or(BookError::UnknownOrderId)?;
+        let current_qty = self.resting_qty(order_id).unwrap_or(Qty::MIN);
+        let price_changed = new_price != meta.price;
+        let qty_increased = new_qty > current_qty;
+        let kept_priority = !price_changed && !qty_increased;
+
+        if kept_priority {
+            // In-place qty update via pricelevel. Strict qty-down or
+            // no-op (same qty + same price). The level keeps the
+            // order in its FIFO queue; nothing else changes.
+            let level = match meta.side {
+                Side::Bid => self.bids.get(&meta.price),
+                Side::Ask => self.asks.get(&meta.price),
+            };
+            let level = level.ok_or(BookError::UnknownOrderId)?;
+            let _ = level.update_order(PlOrderUpdate::UpdateQuantity {
+                order_id: PlId::Sequential(order_id.as_raw()),
+                new_quantity: PlQuantity::new(new_qty.as_lots()),
+            });
+            // No sidecar mutation: side / price / account_id all
+            // unchanged.
+            Ok(ReplaceOutcome {
+                kept_priority: true,
+            })
+        } else {
+            // Lose-priority path: cancel + re-add at the new
+            // (price, qty). The order joins the tail of the new
+            // level's FIFO queue.
+            let account_id = meta.account_id;
+            self.cancel(order_id)?;
+            self.add_resting(RestingOrder {
+                order_id,
+                account_id,
+                side: meta.side,
+                price: new_price,
+                qty: new_qty,
+            })?;
+            Ok(ReplaceOutcome {
+                kept_priority: false,
+            })
+        }
+    }
+
+    /// Cancel every resting order owned by `account`. Each cancelled
+    /// order produces a [`MassCancellation`] record in `out` so the
+    /// engine pipeline can emit a `Cancelled{MassCancel}` exec
+    /// report per order. Returns the number of records appended.
+    ///
+    /// Iteration order is the sorted order of `OrderId` values,
+    /// driven by the `BTreeSet` inside `self.by_account` —
+    /// deterministic across runs (CLAUDE.md "no unordered
+    /// iteration into outputs").
+    pub fn mass_cancel(&mut self, account: AccountId, out: &mut Vec<MassCancellation>) -> usize {
+        // Snapshot the id list so we can mutate the indices below
+        // without invalidating the iterator. The `BTreeSet` clone
+        // is sorted; the snapshot is small (per account) and rare
+        // (mass-cancel is operator-driven, not hot path).
+        let ids: Vec<OrderId> = match self.by_account.get(&account) {
+            Some(set) => set.iter().copied().collect(),
+            None => return 0,
+        };
+        let initial = out.len();
+        for order_id in ids {
+            // Look up meta + level to read the residual qty before
+            // cancelling.
+            let meta = match self.index.get(&order_id) {
+                Some(m) => *m,
+                None => continue,
+            };
+            let level = match meta.side {
+                Side::Bid => self.bids.get(&meta.price),
+                Side::Ask => self.asks.get(&meta.price),
+            };
+            let qty = level
+                .and_then(|l| {
+                    // Pricelevel exposes total_quantity at level
+                    // level; per-order qty needs the queue lookup.
+                    l.iter_orders()
+                        .find(|o| o.id() == PlId::Sequential(order_id.as_raw()))
+                        .map(|o| o.visible_quantity())
+                })
+                .and_then(|q| Qty::new(q).ok())
+                .unwrap_or(Qty::MIN);
+
+            if let Some(level) = level {
+                let _ = level.update_order(PlOrderUpdate::Cancel {
+                    order_id: PlId::Sequential(order_id.as_raw()),
+                });
+                if level.order_count() == 0 {
+                    let _ = match meta.side {
+                        Side::Bid => self.bids.remove(&meta.price),
+                        Side::Ask => self.asks.remove(&meta.price),
+                    };
+                }
+            }
+            self.drop_from_indices(order_id);
+            out.push(MassCancellation {
+                order_id,
+                account_id: meta.account_id,
+                side: meta.side,
+                price: meta.price,
+                qty,
+            });
+        }
+        out.len() - initial
+    }
+
+    /// Read the residual qty of a resting order without mutating
+    /// the level. Used by [`Book::replace`] to decide whether the
+    /// new qty is up or down. `O(level_depth)` since pricelevel
+    /// does not expose a per-order qty accessor; intended for
+    /// occasional ops, not the hot path.
+    #[inline]
+    fn resting_qty(&self, order_id: OrderId) -> Option<Qty> {
+        let meta = self.index.get(&order_id)?;
+        let level = match meta.side {
+            Side::Bid => self.bids.get(&meta.price)?,
+            Side::Ask => self.asks.get(&meta.price)?,
+        };
+        let order = level
+            .iter_orders()
+            .find(|o| o.id() == PlId::Sequential(order_id.as_raw()))?;
+        Qty::new(order.visible_quantity()).ok()
     }
 
     /// Best bid price, or `None` when the bid side is empty.
@@ -1102,5 +1319,254 @@ mod tests {
         // 105 level untouched — different-account maker still resting.
         assert_eq!(book.best_ask(), Some(Price::new(105).expect("ok")));
         assert_eq!(book.side_qty(Side::Ask), 5);
+    }
+
+    // -------------------------------------------------------------------
+    // Post-only would-cross gate
+    // -------------------------------------------------------------------
+
+    fn taker_post_only(id: u64, account: u32, side: Side, price: i64, qty: u64) -> AggressiveOrder {
+        AggressiveOrder {
+            order_id: OrderId::new(id).expect("ok"),
+            account_id: AccountId::new(account).expect("ok"),
+            side,
+            price: Some(Price::new(price).expect("ok")),
+            qty: Qty::new(qty).expect("ok"),
+            tif: domain::Tif::PostOnly,
+        }
+    }
+
+    #[test]
+    fn test_post_only_rejected_when_would_cross_at_arrival() {
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 2, Side::Ask, 100, 5))
+            .expect("add");
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        // Buy post-only at 100 crosses the resting ask at 100 — reject.
+        let r = book.match_aggressive(
+            taker_post_only(99, 7, Side::Bid, 100, 5),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        assert!(r.taker_post_only_rejected);
+        assert_eq!(r.fills_count, 0);
+        assert_eq!(r.stp_cancellations, 0);
+        assert!(!r.taker_stp_cancelled);
+        assert_eq!(r.taker_remaining, Some(Qty::new(5).expect("ok")));
+        assert!(fills.is_empty());
+        assert!(stp.is_empty());
+        // Resting maker untouched.
+        assert_eq!(book.best_ask(), Some(Price::new(100).expect("ok")));
+        assert_eq!(book.side_qty(Side::Ask), 5);
+    }
+
+    #[test]
+    fn test_post_only_not_rejected_when_no_cross() {
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 2, Side::Ask, 105, 5))
+            .expect("add");
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        // Buy post-only at 100 does not cross ask at 105 — gate passes,
+        // walk performs zero fills (no crossing level), engine pipeline
+        // would rest the order in #12.
+        let r = book.match_aggressive(
+            taker_post_only(99, 7, Side::Bid, 100, 5),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        assert!(!r.taker_post_only_rejected);
+        assert_eq!(r.fills_count, 0);
+        assert_eq!(r.taker_remaining, Some(Qty::new(5).expect("ok")));
+    }
+
+    #[test]
+    fn test_post_only_empty_book_not_rejected() {
+        let mut book = Book::new();
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker_post_only(99, 7, Side::Bid, 100, 5),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        assert!(!r.taker_post_only_rejected);
+        assert_eq!(r.fills_count, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Replace (cancel-replace)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_replace_qty_down_same_price_keeps_priority() {
+        let mut book = Book::new();
+        book.add_resting(order(1, Side::Bid, 100, 10)).expect("add");
+        let outcome = book
+            .replace(
+                OrderId::new(1).expect("ok"),
+                Price::new(100).expect("ok"),
+                Qty::new(7).expect("ok"),
+            )
+            .expect("replace");
+        assert!(outcome.kept_priority);
+        assert_eq!(book.side_qty(Side::Bid), 7);
+        assert_eq!(book.best_bid(), Some(Price::new(100).expect("ok")));
+    }
+
+    #[test]
+    fn test_replace_qty_up_same_price_loses_priority() {
+        let mut book = Book::new();
+        book.add_resting(order(1, Side::Bid, 100, 10)).expect("add");
+        let outcome = book
+            .replace(
+                OrderId::new(1).expect("ok"),
+                Price::new(100).expect("ok"),
+                Qty::new(15).expect("ok"),
+            )
+            .expect("replace");
+        assert!(!outcome.kept_priority);
+        assert_eq!(book.side_qty(Side::Bid), 15);
+        assert_eq!(book.best_bid(), Some(Price::new(100).expect("ok")));
+    }
+
+    #[test]
+    fn test_replace_price_change_loses_priority() {
+        let mut book = Book::new();
+        book.add_resting(order(1, Side::Bid, 100, 10)).expect("add");
+        let outcome = book
+            .replace(
+                OrderId::new(1).expect("ok"),
+                Price::new(99).expect("ok"),
+                Qty::new(10).expect("ok"),
+            )
+            .expect("replace");
+        assert!(!outcome.kept_priority);
+        assert_eq!(book.best_bid(), Some(Price::new(99).expect("ok")));
+        assert_eq!(book.side_qty(Side::Bid), 10);
+    }
+
+    #[test]
+    fn test_replace_unknown_order_id_returns_err() {
+        let mut book = Book::new();
+        let r = book.replace(
+            OrderId::new(99).expect("ok"),
+            Price::new(100).expect("ok"),
+            Qty::new(5).expect("ok"),
+        );
+        assert_eq!(r, Err(BookError::UnknownOrderId));
+    }
+
+    #[test]
+    fn test_replace_qty_down_keeps_fifo_position_at_level() {
+        // Two bids at price 100: id 1 first, id 2 second. Replace id 1
+        // qty-down. A subsequent ask cross of 1 lot must hit id 1 first.
+        let mut book = Book::new();
+        book.add_resting(order(1, Side::Bid, 100, 5)).expect("add");
+        book.add_resting(order(2, Side::Bid, 100, 5)).expect("add");
+        let _ = book
+            .replace(
+                OrderId::new(1).expect("ok"),
+                Price::new(100).expect("ok"),
+                Qty::new(3).expect("ok"),
+            )
+            .expect("replace");
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker(99, Side::Ask, Some(100), 1),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        assert_eq!(r.fills_count, 1);
+        // FIFO preserved: id 1 (oldest) hit first.
+        assert_eq!(fills[0].maker_order_id, OrderId::new(1).expect("ok"));
+    }
+
+    // -------------------------------------------------------------------
+    // Mass-cancel
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_mass_cancel_drops_all_account_orders() {
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 7, Side::Bid, 100, 5))
+            .expect("add");
+        book.add_resting(order_acct(2, 7, Side::Ask, 110, 3))
+            .expect("add");
+        // Different account — must NOT be cancelled.
+        book.add_resting(order_acct(3, 2, Side::Bid, 99, 4))
+            .expect("add");
+        let mut out = Vec::new();
+        let n = book.mass_cancel(AccountId::new(7).expect("ok"), &mut out);
+        assert_eq!(n, 2);
+        assert_eq!(out.len(), 2);
+        // Other account preserved.
+        assert_eq!(book.best_bid(), Some(Price::new(99).expect("ok")));
+        assert_eq!(book.side_qty(Side::Bid), 4);
+        assert!(book.best_ask().is_none());
+        // Sidecar cleaned for cancelled ids.
+        assert_eq!(
+            book.cancel(OrderId::new(1).expect("ok")),
+            Err(BookError::UnknownOrderId)
+        );
+        assert_eq!(
+            book.cancel(OrderId::new(2).expect("ok")),
+            Err(BookError::UnknownOrderId)
+        );
+    }
+
+    #[test]
+    fn test_mass_cancel_emits_in_sorted_order_id_order() {
+        // Add ids in non-sorted order — emission must come out sorted
+        // by `OrderId` (BTreeSet inside `by_account`).
+        let mut book = Book::new();
+        book.add_resting(order_acct(7, 7, Side::Bid, 100, 1))
+            .expect("add");
+        book.add_resting(order_acct(2, 7, Side::Bid, 100, 1))
+            .expect("add");
+        book.add_resting(order_acct(5, 7, Side::Bid, 100, 1))
+            .expect("add");
+        let mut out = Vec::new();
+        let n = book.mass_cancel(AccountId::new(7).expect("ok"), &mut out);
+        assert_eq!(n, 3);
+        assert_eq!(out[0].order_id, OrderId::new(2).expect("ok"));
+        assert_eq!(out[1].order_id, OrderId::new(5).expect("ok"));
+        assert_eq!(out[2].order_id, OrderId::new(7).expect("ok"));
+    }
+
+    #[test]
+    fn test_mass_cancel_unknown_account_returns_zero() {
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 2, Side::Bid, 100, 1))
+            .expect("add");
+        let mut out = Vec::new();
+        let n = book.mass_cancel(AccountId::new(99).expect("ok"), &mut out);
+        assert_eq!(n, 0);
+        assert!(out.is_empty());
+        // Untouched.
+        assert_eq!(book.side_qty(Side::Bid), 1);
+    }
+
+    #[test]
+    fn test_mass_cancel_carries_residual_qty() {
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 7, Side::Bid, 100, 9))
+            .expect("add");
+        let mut out = Vec::new();
+        book.mass_cancel(AccountId::new(7).expect("ok"), &mut out);
+        assert_eq!(out[0].qty, Qty::new(9).expect("ok"));
+        assert_eq!(out[0].price, Price::new(100).expect("ok"));
+        assert_eq!(out[0].side, Side::Bid);
+        assert_eq!(out[0].account_id, AccountId::new(7).expect("ok"));
     }
 }
