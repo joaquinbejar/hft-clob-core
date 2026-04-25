@@ -16,8 +16,9 @@ pub const FRAME_KIND_BYTES: usize = 1;
 /// Total header size in bytes: `len` prefix + `kind` byte.
 pub const FRAME_HEADER_BYTES: usize = FRAME_LEN_BYTES + FRAME_KIND_BYTES;
 
-/// Inbound message kind. Numeric discriminants are wire-stable and must
-/// match the table in `docs/protocol.md`.
+/// Wire-level message kind. Numeric discriminants are wire-stable and
+/// must match the table in `docs/protocol.md`. Inbound kinds occupy
+/// `0x01..=0x06`; outbound kinds occupy `0x65..=0x68` (decimal 101..104).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum MessageKind {
@@ -33,6 +34,15 @@ pub enum MessageKind {
     KillSwitchSet = 0x05,
     /// `SnapshotRequest` — operator dump of book + engine state.
     SnapshotRequest = 0x06,
+    /// `ExecReport` — order lifecycle transition (accepted, rejected,
+    /// (partially) filled, cancelled, replaced).
+    ExecReport = 0x65,
+    /// `TradePrint` — public trade emission.
+    TradePrint = 0x66,
+    /// `BookUpdateTop` — top-of-book on every book change.
+    BookUpdateTop = 0x67,
+    /// `BookUpdateL2Delta` — per-level depth delta.
+    BookUpdateL2Delta = 0x68,
 }
 
 impl MessageKind {
@@ -55,6 +65,10 @@ impl TryFrom<u8> for MessageKind {
             0x04 => Ok(Self::MassCancel),
             0x05 => Ok(Self::KillSwitchSet),
             0x06 => Ok(Self::SnapshotRequest),
+            0x65 => Ok(Self::ExecReport),
+            0x66 => Ok(Self::TradePrint),
+            0x67 => Ok(Self::BookUpdateTop),
+            0x68 => Ok(Self::BookUpdateL2Delta),
             other => Err(WireError::UnknownKind(other)),
         }
     }

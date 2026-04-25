@@ -35,7 +35,18 @@ encoders, decoders, and roundtrip tests.
 | 5    | 0x05  | `KillSwitchSet`   | 24 bytes     | Admin halt / resume                 |
 | 6    | 0x06  | `SnapshotRequest` | 16 bytes     | Operator dump of book + engine state |
 
-Outbound message kinds (101+) land in #5.
+### Outbound message kinds
+
+| Kind | Hex   | Name                | Payload size | Purpose                                            |
+|------|-------|---------------------|--------------|----------------------------------------------------|
+| 101  | 0x65  | `ExecReport`        | 64 bytes     | Order lifecycle transition (accepted, rejected, (partially) filled, cancelled, replaced) |
+| 102  | 0x66  | `TradePrint`        | 48 bytes     | Public trade emission                              |
+| 103  | 0x67  | `BookUpdateTop`     | 48 bytes     | Top-of-book on every book change                   |
+| 104  | 0x68  | `BookUpdateL2Delta` | 40 bytes     | Per-level depth delta (level removed when `new_qty = 0`) |
+
+`SnapshotResponse` (105) is intentionally absent from the bespoke
+fixed-size pattern; the variable-length book depth array lives behind a
+separate framing scheme to be added under a later issue.
 
 ### Decode invariants
 

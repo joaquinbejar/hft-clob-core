@@ -38,16 +38,23 @@ agree on every bit.
 
 ## Message-kind table
 
-| Kind | Hex   | Direction | Name              | Size (kind + payload) |
-|------|-------|-----------|-------------------|-----------------------|
-| 1    | 0x01  | inbound   | `NewOrder`        | 41 bytes              |
-| 2    | 0x02  | inbound   | `CancelOrder`     | 25 bytes              |
-| 3    | 0x03  | inbound   | `CancelReplace`   | 41 bytes              |
-| 4    | 0x04  | inbound   | `MassCancel`      | 17 bytes              |
-| 5    | 0x05  | inbound   | `KillSwitchSet`   | 25 bytes              |
-| 6    | 0x06  | inbound   | `SnapshotRequest` | 17 bytes              |
+| Kind | Hex   | Direction | Name                | Size (kind + payload) |
+|------|-------|-----------|---------------------|-----------------------|
+| 1    | 0x01  | inbound   | `NewOrder`          | 41 bytes              |
+| 2    | 0x02  | inbound   | `CancelOrder`       | 25 bytes              |
+| 3    | 0x03  | inbound   | `CancelReplace`     | 41 bytes              |
+| 4    | 0x04  | inbound   | `MassCancel`        | 17 bytes              |
+| 5    | 0x05  | inbound   | `KillSwitchSet`     | 25 bytes              |
+| 6    | 0x06  | inbound   | `SnapshotRequest`   | 17 bytes              |
+| 101  | 0x65  | outbound  | `ExecReport`        | 65 bytes              |
+| 102  | 0x66  | outbound  | `TradePrint`        | 49 bytes              |
+| 103  | 0x67  | outbound  | `BookUpdateTop`     | 49 bytes              |
+| 104  | 0x68  | outbound  | `BookUpdateL2Delta` | 41 bytes              |
 
-Outbound message kinds (templateIds 101..) land in issue #5.
+`SnapshotResponse` (kind 0x69 / 105) is intentionally absent — the
+variable-length book depth array conflicts with the bespoke fixed-size
+pattern this crate uses, so it lives behind a separate framing scheme
+to be added under a later issue.
 
 ## Inbound layouts
 
@@ -128,3 +135,71 @@ priority; qty up → new priority; qty down → in-place, priority preserved.
   `WireError::NonZeroPad(offset)`.
 - Each integer field is parsed into its corresponding `domain::` newtype
   at the boundary; validation failures surface as `WireError::Domain(_)`.
+
+## Outbound layouts
+
+### `ExecReport` (kind = 0x65 / 101)
+
+| Offset | Size | Field           | Type | Notes                                                                    |
+|-------:|-----:|-----------------|------|--------------------------------------------------------------------------|
+| 0      | 8    | `engine_seq`    | u64  | strictly monotonic across all outbound streams                           |
+| 8      | 8    | `order_id`      | u64  |                                                                          |
+| 16     | 4    | `account_id`    | u32  |                                                                          |
+| 20     | 1    | `state`         | u8   | `ExecState`: `1=Accepted`, `2=Rejected`, `3=PartiallyFilled`, `4=Filled`, `5=Cancelled`, `6=Replaced` |
+| 21     | 1    | `reject_reason` | u8   | `RejectReason` discriminant; `0` when `state != Rejected`                |
+| 22     | 1    | `cancel_reason` | u8   | `CancelReason` discriminant; `0` when `state ∉ {Cancelled, Replaced}`    |
+| 23     | 1    | `_pad0`         | u8   | zero                                                                     |
+| 24     | 8    | `fill_price`    | i64  | ticks; `0` when no fill                                                  |
+| 32     | 8    | `fill_qty`      | u64  | lots; `0` when no fill                                                   |
+| 40     | 8    | `leaves_qty`    | u64  | lots; `0` after a terminal fill / cancel / reject                        |
+| 48     | 8    | `recv_ts`       | u64  | echo of the inbound `recv_ts`                                            |
+| 56     | 8    | `emit_ts`       | u64  | engine emit timestamp                                                    |
+| —      | 64   | **total**       |      |                                                                          |
+
+### `TradePrint` (kind = 0x66 / 102)
+
+| Offset | Size | Field             | Type    | Notes                              |
+|-------:|-----:|-------------------|---------|------------------------------------|
+| 0      | 8    | `engine_seq`      | u64     |                                    |
+| 8      | 8    | `trade_id`        | u64     | engine-internal monotonic          |
+| 16     | 8    | `price`           | i64     | ticks; equals the maker price      |
+| 24     | 8    | `qty`             | u64     | lots                               |
+| 32     | 1    | `aggressor_side`  | u8      | `Side` discriminant                |
+| 33     | 7    | `_pad0`           | [u8; 7] | all zero                           |
+| 40     | 8    | `emit_ts`         | u64     |                                    |
+| —      | 48   | **total**         |         |                                    |
+
+### `BookUpdateTop` (kind = 0x67 / 103)
+
+| Offset | Size | Field        | Type | Notes                                          |
+|-------:|-----:|--------------|------|------------------------------------------------|
+| 0      | 8    | `engine_seq` | u64  |                                                |
+| 8      | 8    | `bid_price`  | i64  | ticks; `0` when the bid side is empty          |
+| 16     | 8    | `bid_qty`    | u64  | lots; `0` when the bid side is empty           |
+| 24     | 8    | `ask_price`  | i64  | ticks; `0` when the ask side is empty          |
+| 32     | 8    | `ask_qty`    | u64  | lots; `0` when the ask side is empty           |
+| 40     | 8    | `emit_ts`    | u64  |                                                |
+| —      | 48   | **total**    |      |                                                |
+
+### `BookUpdateL2Delta` (kind = 0x68 / 104)
+
+| Offset | Size | Field        | Type    | Notes                                                  |
+|-------:|-----:|--------------|---------|--------------------------------------------------------|
+| 0      | 8    | `engine_seq` | u64     |                                                        |
+| 8      | 8    | `price`      | i64     | level price in ticks                                   |
+| 16     | 8    | `new_qty`    | u64     | new aggregate qty at this level; `0` removes the level |
+| 24     | 1    | `side`       | u8      | `Side` discriminant                                    |
+| 25     | 7    | `_pad0`      | [u8; 7] | all zero                                               |
+| 32     | 8    | `emit_ts`    | u64     |                                                        |
+| —      | 40   | **total**    |         |                                                        |
+
+## Roundtrip property
+
+`crates/wire/tests/roundtrip.rs` proptest matrix asserts, per message:
+
+- `decode(encode(x)) == x` (value-identical), and
+- `encode(decode(encode(x))) == encode(x)` (byte-identical).
+
+`RejectReason` (15 variants), `CancelReason` (5), `ExecState` (6),
+`Side`, `OrderType`, `Tif`, `KillSwitchState` are exhaustively covered
+via `prop_oneof![all variants]` strategies.

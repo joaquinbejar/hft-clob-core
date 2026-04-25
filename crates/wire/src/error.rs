@@ -46,6 +46,13 @@ pub enum WireError {
     /// prefix.
     #[error("framed payload size exceeds u32::MAX: {0} bytes")]
     PayloadTooLarge(usize),
+    /// A wire payload decoded into a domain message that violates a
+    /// cross-field invariant — for example an `ExecReport` with
+    /// `state = Accepted` but a non-zero `reject_reason`, or a
+    /// `BookUpdateTop` side where only one of `price` / `qty` is zero.
+    /// The slice carries a short identifier for the failing rule.
+    #[error("inconsistent payload: {0}")]
+    InconsistentPayload(&'static str),
     /// A field failed `domain` validation (e.g. zero `OrderId`,
     /// non-positive `Price`, unknown `Side` discriminant).
     #[error(transparent)]
