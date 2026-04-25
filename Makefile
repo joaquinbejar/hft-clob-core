@@ -207,6 +207,13 @@ dhat:
 throughput:
 	cargo run --release --bin throughput_bench
 
+# Closed-loop bench with coordinated-omission correction.
+# Usage: make co-bench RATE=100000 (default 200k ops/sec).
+RATE ?= 200000
+.PHONY: co-bench
+co-bench:
+	TARGET_OPS_PER_SEC=$(RATE) cargo run --release --bin co_bench
+
 # Full bench (Criterion, default budget). Allow ~18 min wall-clock.
 .PHONY: bench-full
 bench-full:
