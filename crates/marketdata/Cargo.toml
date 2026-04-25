@@ -1,0 +1,18 @@
+[package]
+name = "marketdata"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+domain = { workspace = true }
+wire = { workspace = true }
+ironsbe-channel = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true

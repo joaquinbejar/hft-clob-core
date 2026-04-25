@@ -1,0 +1,19 @@
+[package]
+name = "wire"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+domain = { workspace = true }
+ironsbe-core = { workspace = true }
+ironsbe-derive = { workspace = true }
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

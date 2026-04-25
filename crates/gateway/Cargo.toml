@@ -1,0 +1,24 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+domain = { workspace = true }
+wire = { workspace = true }
+tokio = { workspace = true, features = ["rt", "io-util", "net", "macros", "time"] }
+ironsbe-transport = { workspace = true }
+ironsbe-server = { workspace = true }
+ironsbe-channel = { workspace = true }
+ironsbe-core = { workspace = true }
+bytes.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
