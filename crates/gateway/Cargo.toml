@@ -26,3 +26,4 @@ proptest.workspace = true
 engine = { workspace = true }
 risk = { workspace = true }
 matching = { workspace = true }
+tempfile = { workspace = true }
