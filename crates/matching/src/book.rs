@@ -83,7 +83,11 @@ impl Book {
         if self.index.contains_key(&order.order_id) {
             return Err(BookError::DuplicateOrderId);
         }
-        let next_seq = self.seq.checked_add(1).ok_or(BookError::SeqOverflow)?;
+        // Bump the arrival counter first so `TimestampMs` reflects the
+        // post-add value rather than lagging by one. CLAUDE.md forbids
+        // `wrapping_*` / `saturating_*` on protocol counters; surface
+        // overflow as `SeqOverflow`.
+        self.seq = self.seq.checked_add(1).ok_or(BookError::SeqOverflow)?;
 
         let levels = match order.side {
             Side::Bid => &mut self.bids,
@@ -116,7 +120,6 @@ impl Book {
             .add_order(pl_order);
 
         self.index.insert(order.order_id, (order.side, order.price));
-        self.seq = next_seq;
         Ok(())
     }
 
@@ -129,32 +132,31 @@ impl Book {
     /// was fully filled.
     #[inline]
     pub fn cancel(&mut self, order_id: OrderId) -> Result<(Side, Price), BookError> {
-        let (side, price) = self
-            .index
-            .remove(&order_id)
-            .ok_or(BookError::UnknownOrderId)?;
+        // Look up first without mutating. If the level is missing the
+        // book is already corrupt (sidecar / price index out of sync),
+        // but at least the sidecar entry stays in place so a retry can
+        // see the same view rather than a partially-rolled-back state.
+        let (side, price) = *self.index.get(&order_id).ok_or(BookError::UnknownOrderId)?;
         let levels = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
-        let remove_level = if let Some(level) = levels.get(&price) {
-            // TODO(#12): `update_order` returns the cancelled order
-            // record so the engine pipeline can emit a
-            // `Cancelled{reason}` exec report carrying the leaves_qty.
-            // Allocator behaviour of the discard path needs revisiting
-            // when that wiring lands — if the inner `Option<Arc<…>>`
-            // boxes per call, swap to a `remove_by_id`-shaped path.
-            let _ = level.update_order(PlOrderUpdate::Cancel {
-                order_id: PlId::Sequential(order_id.as_raw()),
-            });
-            level.order_count() == 0
-        } else {
-            // Index claimed the level exists but it doesn't — the
-            // sidecar and the price index are out of sync, which is an
-            // internal bug. Fail loud rather than silently corrupt.
-            return Err(BookError::UnknownOrderId);
-        };
-        if remove_level {
+        let level = levels.get(&price).ok_or(BookError::UnknownOrderId)?;
+        // TODO(#12): `update_order` returns the cancelled order record
+        // so the engine pipeline can emit a `Cancelled{reason}` exec
+        // report carrying the `leaves_qty`. Allocator behaviour of the
+        // discard path needs revisiting when that wiring lands — if
+        // the inner `Option<Arc<…>>` boxes per call, swap to a
+        // `remove_by_id`-shaped path.
+        let _ = level.update_order(PlOrderUpdate::Cancel {
+            order_id: PlId::Sequential(order_id.as_raw()),
+        });
+        let level_empty = level.order_count() == 0;
+
+        // Pricelevel cancel is observable; only now is it safe to
+        // mutate the sidecar and prune an empty level.
+        self.index.remove(&order_id);
+        if level_empty {
             levels.remove(&price);
         }
         Ok((side, price))
