@@ -22,6 +22,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 hdrhistogram.workspace = true
 dhat = { workspace = true, optional = true }
+core_affinity = { workspace = true, optional = true }
 
 [features]
 # Enables `dhat-rs` allocation profiling on the smoke bench. Wires
@@ -29,6 +30,12 @@ dhat = { workspace = true, optional = true }
 # `cargo run --release --features hotpath-dhat --bin dhat_bench`
 # runs.
 hotpath-dhat = ["dep:dhat"]
+# Enables `core_affinity`-based CPU pinning of the engine thread.
+# When enabled the engine binary accepts `--engine-core <N>` and
+# pins the matching thread to that physical core via
+# `core_affinity::set_for_current`. Linux is best-supported;
+# macOS treats the call as a soft hint via QoS.
+pinned-engine = ["dep:core_affinity"]
 
 [dev-dependencies]
 proptest.workspace = true
