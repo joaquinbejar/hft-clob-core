@@ -18,9 +18,18 @@ use tokio::sync::broadcast;
 use tracing::warn;
 use wire::outbound::Outbound;
 
+use crate::listener::OutboundSubscriber;
+
 /// Channel-backed [`OutboundSink`]. The engine thread holds the
 /// `Sender`; tokio writer tasks `subscribe()` to receive framed
 /// bytes ready for TCP `write_all`.
+///
+/// `Clone` is cheap — the inner `broadcast::Sender` is itself
+/// `Clone`, and every clone broadcasts onto the same underlying
+/// channel. The engine binary clones the sink into the listener
+/// (Arc-wrapped, subscribe-only) so producer and subscribers share
+/// one stream.
+#[derive(Clone)]
 pub struct ChannelSink {
     tx: broadcast::Sender<Bytes>,
 }
@@ -47,6 +56,12 @@ impl ChannelSink {
     #[must_use]
     pub fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
+    }
+}
+
+impl OutboundSubscriber for ChannelSink {
+    fn subscribe(&self) -> broadcast::Receiver<Bytes> {
+        ChannelSink::subscribe(self)
     }
 }
 
