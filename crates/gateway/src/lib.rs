@@ -11,5 +11,8 @@
 
 /// TCP listener and per-connection inbound decoder.
 pub mod listener;
+/// Outbound channel sink — engine emits, async writer drains.
+pub mod sink;
 
 pub use listener::{DEFAULT_READ_BUFFER, handle_connection, run};
+pub use sink::ChannelSink;

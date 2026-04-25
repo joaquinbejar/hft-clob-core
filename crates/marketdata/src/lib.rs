@@ -1,8 +1,17 @@
 //! Outbound stream emission — market data and execution reports.
 //!
-//! Consumes `OutEvent` from the matching core and encodes them into
-//! on-wire messages: trade prints, top-of-book updates, and execution reports.
-//! Emits to TCP or file via the outbound channel.
-//!
-//! Maintains `engine_seq` consistency and gap-detection hooks for packet loss.
-//! L2 incremental snapshot + delta recovery is a stretch goal.
+//! Encodes [`wire::outbound::Outbound`] events from the engine into
+//! framed bytes ready for TCP / file emission. Sync — runs on the
+//! engine thread or a dedicated drainer; tokio fan-out lives in
+//! `crates/gateway/src/sink.rs`.
+
+#![warn(missing_docs)]
+
+/// Outbound encoder + decoder (round-trip-safe).
+pub mod encoder;
+/// `OutboundSink` trait — abstract publishing interface used by the
+/// engine and tests / replay alike.
+pub mod sink;
+
+pub use encoder::{FRAME_HEADER_BYTES, decode, encode};
+pub use sink::{OutboundSink, VecSink};

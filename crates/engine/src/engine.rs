@@ -39,7 +39,7 @@ use wire::inbound::{
 };
 use wire::outbound::{BookUpdateTop, ExecReport, Outbound, TradePrint};
 
-use crate::sink::OutboundSink;
+use marketdata::OutboundSink;
 
 /// Per-resting-order metadata the engine keeps so it can stamp exec
 /// reports for terminal events (full fills, cancels, STP, mass-cancel).
@@ -48,8 +48,12 @@ use crate::sink::OutboundSink;
 struct OrderRegistryEntry {
     account_id: AccountId,
     side: Side,
-    /// Original limit price * qty notional, used to back out the
-    /// per-account `RiskState.notional` on terminal events.
+    /// Current resting qty. Decremented on every partial fill;
+    /// dropped from the registry on terminal events.
+    qty: Qty,
+    /// Current resting notional (`price_ticks * qty_lots`). Used to
+    /// back out the per-account `RiskState.notional` on terminal
+    /// events; recomputed alongside `qty` on partial fills.
     notional: u128,
 }
 
@@ -108,6 +112,13 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
     #[must_use]
     pub fn risk(&self) -> &RiskState {
         &self.risk
+    }
+
+    /// Mutable accessor on the embedded sink. Intended for tests and
+    /// the replay harness — production code consumes the sink via
+    /// `OutboundSink::emit` only.
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
     }
 
     /// Drive one inbound command through the full pipeline.
@@ -214,10 +225,16 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             } else {
                 ExecState::PartiallyFilled
             };
+            // Compute the maker's residual qty AFTER this fill so the
+            // partial-fill exec report's `leaves_qty` is correct.
+            // Full-fill terminates the maker → leaves is None.
             let maker_leaves = if fill.maker_fully_filled {
                 None
             } else {
-                self.maker_leaves_after_partial(fill.maker_order_id, fill.qty)
+                self.registry.get(&fill.maker_order_id).and_then(|e| {
+                    let new_lots = e.qty.as_lots().saturating_sub(fill.qty.as_lots());
+                    Qty::new(new_lots).ok()
+                })
             };
             self.emit_exec_report_fill(
                 fill.maker_order_id,
@@ -259,9 +276,13 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             } else if let Some(entry) = self.registry.get_mut(&fill.maker_order_id) {
                 let consumed_notional = notional_of(fill.price, fill.qty);
                 let new_notional = entry.notional.saturating_sub(consumed_notional);
+                let new_qty_lots = entry.qty.as_lots().saturating_sub(fill.qty.as_lots());
                 self.risk
                     .on_order_removed(entry.account_id, consumed_notional);
                 entry.notional = new_notional;
+                if let Ok(q) = Qty::new(new_qty_lots) {
+                    entry.qty = q;
+                }
             }
         }
 
@@ -328,6 +349,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                             OrderRegistryEntry {
                                 account_id: msg.account_id,
                                 side: msg.side,
+                                qty: remaining,
                                 notional: resting_notional,
                             },
                         );
@@ -452,6 +474,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                         OrderRegistryEntry {
                             account_id: msg.account_id,
                             side: old_entry.map(|e| e.side).unwrap_or(Side::Bid),
+                            qty: msg.new_qty,
                             notional: new_notional,
                         },
                     );
@@ -692,16 +715,6 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
         };
         self.sink.emit(Outbound::BookUpdateTop(update));
     }
-
-    fn maker_leaves_after_partial(&self, _order_id: OrderId, _filled: Qty) -> Option<Qty> {
-        // Pricelevel doesn't expose a per-order qty accessor on the
-        // public surface, and the matching crate's `Fill` carries
-        // `maker_fully_filled` but not the residual. For v1 the
-        // partial-fill exec report omits `leaves_qty` (encoded as a
-        // sentinel); a follow-up wires the residual through
-        // `Fill` itself. Tracked under the matching crate.
-        None
-    }
 }
 
 #[inline]
@@ -725,8 +738,8 @@ mod tests {
     use super::*;
     use crate::clock::StubClock;
     use crate::ids::CounterIdGenerator;
-    use crate::sink::VecSink;
     use domain::{ClientTs, OrderType};
+    use marketdata::VecSink;
 
     fn engine_with_stub() -> Engine<StubClock, CounterIdGenerator, VecSink> {
         Engine::new(
