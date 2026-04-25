@@ -1,8 +1,31 @@
-//! Binary wire protocol — SBE-based schema, encoders, decoders.
+//! Binary wire protocol — bespoke, fixed-size, little-endian.
 //!
-//! Defines the on-wire message format for order entry (inbound) and
-//! market data / execution reports (outbound). Uses IronSBE for zero-copy
-//! schema and code generation. All lengths are little-endian; framing is
-//! length-prefixed TCP (first 4 bytes = message length in bytes).
+//! This crate is a pure codec. It does not import `tokio` or any
+//! transport library; the gateway feeds it `&[u8]` slices and consumes
+//! `Vec<u8>` writes. See `docs/protocol.md` for the on-wire layout
+//! tables — the prose there is the single source of truth and any
+//! encoder change must update both files in the same commit.
 //!
-//! Roundtrip tests will verify encode → decode preserves all fields byte-identically (issue #5).
+//! Inbound message kinds (this crate, issue #4):
+//!
+//! - `NewOrder` (0x01)
+//! - `CancelOrder` (0x02)
+//! - `CancelReplace` (0x03)
+//! - `MassCancel` (0x04)
+//! - `KillSwitchSet` (0x05)
+//! - `SnapshotRequest` (0x06)
+//!
+//! Outbound message kinds (issue #5) live behind `crate::outbound`.
+
+#![warn(missing_docs)]
+
+pub mod error;
+pub mod framing;
+pub mod inbound;
+
+pub use error::WireError;
+pub use framing::{FRAME_HEADER_BYTES, FRAME_KIND_BYTES, FRAME_LEN_BYTES, Frame, MessageKind};
+
+/// Wire-protocol version. Bump on any layout change to inbound or
+/// outbound message bodies.
+pub const WIRE_VERSION: u16 = 1;
