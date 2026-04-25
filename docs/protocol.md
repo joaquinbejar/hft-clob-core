@@ -7,18 +7,34 @@ encoder or decoder change must update this document in the same commit.
 
 | Constant         | Value                                              |
 |------------------|----------------------------------------------------|
-| Endianness       | little-endian (target is x86_64; avoids per-field byte swaps on the hot path) |
+| Endianness       | little-endian (target is x86_64; avoids per-field byte swaps on the hot path). Enforced at compile time — `crates/wire/src/lib.rs` carries a `compile_error!` on `target_endian = "big"` |
 | Framing          | `len: u32 \| kind: u8 \| payload: [u8; len - 1]`   |
 | Alignment        | packed (`#[repr(C, packed)]`); decoder rejects non-zero padding |
 | Strings          | not used; all identifiers are fixed-width integers |
-| Timestamps       | `u64` nanoseconds (carried opaque on the wire; the matching engine never reads them for control flow) |
+| Timestamps       | wire-level `u64` nanoseconds; carried opaque, the matching engine never reads them for control flow |
 | Price / Qty      | `i64` ticks / `u64` lots; see `domain::consts::{TICK_SIZE, LOT_SIZE}` |
 | Wire version     | `WIRE_VERSION = 1`. Bump on any layout change      |
 
 The `len` field counts bytes from the `kind` byte through the end of the
 payload (i.e. `len = 1 + payload.len()`). A frame is therefore `4 + len`
 bytes total. Decoders that encounter an unknown `kind` advance `len`
-bytes and continue.
+bytes and continue — see `Frame::parse_or_skip` in `crates/wire/src/framing.rs`.
+
+### Timestamp representation
+
+The wire field is `u64`. The corresponding domain newtypes
+(`domain::ClientTs`, `domain::RecvTs`) are `i64`. Encode and decode
+perform a bit-preserving `as` cast between the two:
+
+- Encode: `i64 as u64` reinterprets the two's-complement bits.
+- Decode: `u64 as i64` reinterprets the same bits back.
+
+A negative `i64` timestamp therefore encodes as a `u64` value above
+`i64::MAX`. The cast is lossless and the roundtrip is byte-identical.
+The matching core never reads the value for control flow, so the
+signed / unsigned interpretation is irrelevant beyond storage; clients
+that read the wire as `u64` and the engine that reads it as `i64`
+agree on every bit.
 
 ## Message-kind table
 

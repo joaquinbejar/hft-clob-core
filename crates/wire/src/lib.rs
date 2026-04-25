@@ -15,9 +15,19 @@
 //! - `KillSwitchSet` (0x05)
 //! - `SnapshotRequest` (0x06)
 //!
-//! Outbound message kinds (issue #5) live behind `crate::outbound`.
+//! Outbound message kinds (issue #5) will live behind a future
+//! `crate::outbound` module.
 
 #![warn(missing_docs)]
+
+// The wire format is little-endian by design (skill / `docs/protocol.md`).
+// Compile-fail on big-endian targets so a packed payload encoded on a
+// BE host never silently decodes back as endian-swapped garbage.
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "hft-clob-core wire format is little-endian; \
+     `target_endian = \"big\"` is unsupported"
+);
 
 pub mod error;
 pub mod framing;

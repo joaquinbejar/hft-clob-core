@@ -28,6 +28,24 @@ pub enum WireError {
         /// Observed payload size in bytes.
         got: usize,
     },
+    /// A wire-only payload enum (e.g. `KillSwitchState`) carried a
+    /// discriminant outside its assigned range. Distinct from
+    /// [`WireError::UnknownKind`], which targets the frame header's
+    /// message-kind byte.
+    #[error("invalid `{field}` discriminant: {value}")]
+    InvalidEnumValue {
+        /// Name of the wire field that failed to decode.
+        field: &'static str,
+        /// Observed discriminant byte.
+        value: u8,
+    },
+    /// `Frame::write` was called with a payload whose framed size
+    /// (`1 + payload.len()`) exceeds [`u32::MAX`]. Inbound payloads in
+    /// this crate are fixed-size and far below that ceiling, but the
+    /// encoder rejects rather than silently truncating the length
+    /// prefix.
+    #[error("framed payload size exceeds u32::MAX: {0} bytes")]
+    PayloadTooLarge(usize),
     /// A field failed `domain` validation (e.g. zero `OrderId`,
     /// non-positive `Price`, unknown `Side` discriminant).
     #[error(transparent)]

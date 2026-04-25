@@ -17,7 +17,7 @@ pub struct KillSwitchSetWire {
     /// Shared-secret token; the engine compares against its admin token.
     pub admin_token: u64,
     /// `0` = resume, `1` = halt. Other values are decoded as
-    /// [`WireError::Domain`] downstream.
+    /// [`WireError::InvalidEnumValue`] with `field = "state"`.
     pub state: u8,
     /// Reserved padding; every byte must be zero.
     pub _pad0: [u8; 7],
@@ -55,7 +55,10 @@ impl TryFrom<u8> for KillSwitchState {
         match v {
             0 => Ok(Self::Resume),
             1 => Ok(Self::Halt),
-            other => Err(WireError::UnknownKind(other)),
+            other => Err(WireError::InvalidEnumValue {
+                field: "state",
+                value: other,
+            }),
         }
     }
 }
@@ -148,11 +151,17 @@ mod tests {
     }
 
     #[test]
-    fn test_kill_switch_unknown_state_returns_err() {
+    fn test_kill_switch_unknown_state_returns_invalid_enum_value() {
         let mut buf = Vec::new();
         encode(&sample(KillSwitchState::Halt), &mut buf);
         buf[16] = 0x05; // state field
-        assert_eq!(parse(&buf), Err(WireError::UnknownKind(5)));
+        assert_eq!(
+            parse(&buf),
+            Err(WireError::InvalidEnumValue {
+                field: "state",
+                value: 5,
+            })
+        );
     }
 
     #[test]
