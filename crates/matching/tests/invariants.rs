@@ -55,11 +55,10 @@ fn arb_command_sequence() -> impl Strategy<Value = Vec<Command>> {
 // Test utilities
 // ============================================================================
 
-fn apply_commands(
-    book: &mut Book,
-    commands: &[Command],
-) -> (HashMap<u64, (Side, Price, Qty, AccountId)>, usize) {
-    let mut order_map: HashMap<u64, (Side, Price, Qty, AccountId)> = HashMap::new();
+type OrderEntry = (Side, Price, Qty, AccountId);
+
+fn apply_commands(book: &mut Book, commands: &[Command]) -> (HashMap<u64, OrderEntry>, usize) {
+    let mut order_map: HashMap<u64, OrderEntry> = HashMap::new();
     let mut cancels = 0;
 
     for cmd in commands {
@@ -89,11 +88,11 @@ fn apply_commands(
                 }
             }
             Command::Cancel { order_id } => {
-                if let Ok(oid) = OrderId::try_from(*order_id) {
-                    if book.cancel(oid).is_ok() {
-                        order_map.remove(order_id);
-                        cancels += 1;
-                    }
+                if let Ok(oid) = OrderId::try_from(*order_id)
+                    && book.cancel(oid).is_ok()
+                {
+                    order_map.remove(order_id);
+                    cancels += 1;
                 }
             }
         }
