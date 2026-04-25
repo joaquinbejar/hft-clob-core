@@ -84,6 +84,11 @@ pub struct Engine<C: Clock, I: IdGenerator, S: OutboundSink> {
     stp_buf: Vec<StpCancellation>,
     /// Scratch buffer for mass-cancel emissions.
     mass_buf: Vec<MassCancellation>,
+    /// Pre-step level snapshot (sorted by `(Side as u8, Price asc)`).
+    /// Drives the L2 delta diff at the end of `step()`.
+    pre_step_levels: Vec<(Side, Price, u64)>,
+    /// Post-step level snapshot, same shape as `pre_step_levels`.
+    post_step_levels: Vec<(Side, Price, u64)>,
 }
 
 impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
@@ -101,6 +106,8 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             fills_buf: Vec::with_capacity(128),
             stp_buf: Vec::with_capacity(16),
             mass_buf: Vec::with_capacity(64),
+            pre_step_levels: Vec::with_capacity(64),
+            post_step_levels: Vec::with_capacity(64),
         }
     }
 
@@ -133,8 +140,29 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
     }
 
     /// Drive one inbound command through the full pipeline.
+    ///
+    /// Per-step emission tail (after the handler returns):
+    ///
+    /// 1. One `BookUpdateL2Delta` for every level whose qty changed
+    ///    in this step — sorted by `(side as u8, price ascending)` so
+    ///    emission order is deterministic across runs.
+    /// 2. One `BookUpdateTop` snapshot of the post-step best bid /
+    ///    best ask. Emitted last so subscribers update their L2
+    ///    mirror first, then react to the top-of-book tick.
+    ///
+    /// `KillSwitchSet` and `SnapshotRequest` skip the book-change
+    /// tail — neither mutates the book.
     pub fn step(&mut self, inbound: Inbound) {
         let recv_ts = self.clock.now();
+
+        let emit_book_changes = !matches!(
+            inbound,
+            Inbound::KillSwitchSet(_) | Inbound::SnapshotRequest(_)
+        );
+        if emit_book_changes {
+            self.capture_pre_step_levels();
+        }
+
         match inbound {
             Inbound::NewOrder(msg) => self.handle_new_order(msg, recv_ts),
             Inbound::CancelOrder(msg) => self.handle_cancel_order(msg, recv_ts),
@@ -143,6 +171,107 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             Inbound::KillSwitchSet(msg) => self.handle_kill_switch(msg),
             Inbound::SnapshotRequest(msg) => self.handle_snapshot_request(msg, recv_ts),
         }
+
+        if emit_book_changes {
+            self.capture_post_step_levels();
+            self.emit_l2_deltas(recv_ts);
+            self.emit_book_update_top(recv_ts);
+        }
+    }
+
+    /// Capture the bid + ask sides into `dst` in `(Side::Bid asc, Side::Ask
+    /// asc)` order — lex order on `(Side as u8, Price)`. Steady-state
+    /// alloc-free: pushes directly into the persistent scratch buffer
+    /// and reverses the bid prefix in place.
+    #[inline]
+    fn capture_levels_into(book: &Book, dst: &mut Vec<(Side, Price, u64)>) {
+        dst.clear();
+        let bid_start = dst.len();
+        for (price, qty) in book.bid_levels() {
+            dst.push((Side::Bid, price, qty));
+        }
+        // bid_levels iterates descending; flip in place to ascending so
+        // the diff loop walks both Vecs in matching lex order.
+        dst[bid_start..].reverse();
+        for (price, qty) in book.ask_levels() {
+            dst.push((Side::Ask, price, qty));
+        }
+    }
+
+    #[inline]
+    fn capture_pre_step_levels(&mut self) {
+        Self::capture_levels_into(&self.book, &mut self.pre_step_levels);
+    }
+
+    #[inline]
+    fn capture_post_step_levels(&mut self) {
+        Self::capture_levels_into(&self.book, &mut self.post_step_levels);
+    }
+
+    fn emit_l2_deltas(&mut self, recv_ts: RecvTs) {
+        // Two-pointer merge over pre + post (both sorted by
+        // (Side as u8, price asc)). Emit a delta when a key:
+        // - exists in both with different qty,
+        // - exists only in pre (level removed),
+        // - exists only in post (new level).
+        let mut i = 0;
+        let mut j = 0;
+        let pre_len = self.pre_step_levels.len();
+        let post_len = self.post_step_levels.len();
+        while i < pre_len || j < post_len {
+            let pre_key = self.pre_step_levels.get(i).map(|t| (t.0.as_u8(), t.1));
+            let post_key = self.post_step_levels.get(j).map(|t| (t.0.as_u8(), t.1));
+            match (pre_key, post_key) {
+                (Some(pk), Some(qk)) if pk == qk => {
+                    let pre_qty = self.pre_step_levels[i].2;
+                    let post_qty = self.post_step_levels[j].2;
+                    if pre_qty != post_qty {
+                        let (side, price, _) = self.post_step_levels[j];
+                        self.emit_l2_delta(side, price, post_qty, recv_ts);
+                    }
+                    i += 1;
+                    j += 1;
+                }
+                (Some(pk), Some(qk)) if pk < qk => {
+                    let (side, price, _) = self.pre_step_levels[i];
+                    // Level removed.
+                    self.emit_l2_delta(side, price, 0, recv_ts);
+                    i += 1;
+                }
+                (Some(_), Some(_)) => {
+                    let (side, price, qty) = self.post_step_levels[j];
+                    self.emit_l2_delta(side, price, qty, recv_ts);
+                    j += 1;
+                }
+                (Some(_), None) => {
+                    let (side, price, _) = self.pre_step_levels[i];
+                    self.emit_l2_delta(side, price, 0, recv_ts);
+                    i += 1;
+                }
+                (None, Some(_)) => {
+                    let (side, price, qty) = self.post_step_levels[j];
+                    self.emit_l2_delta(side, price, qty, recv_ts);
+                    j += 1;
+                }
+                (None, None) => break,
+            }
+        }
+    }
+
+    fn emit_l2_delta(&mut self, side: Side, price: Price, new_qty: u64, _recv_ts: RecvTs) {
+        let new_qty = if new_qty == 0 {
+            None
+        } else {
+            Qty::new(new_qty).ok()
+        };
+        let delta = wire::outbound::BookUpdateL2Delta {
+            engine_seq: self.next_seq(),
+            price,
+            new_qty,
+            side,
+            emit_ts: self.clock.now(),
+        };
+        self.sink.emit(Outbound::BookUpdateL2Delta(delta));
     }
 
     fn handle_snapshot_request(&mut self, msg: SnapshotRequest, recv_ts: RecvTs) {
@@ -190,7 +319,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
         // account caps).
         if let Err(reason) = self.risk.check_new_order(&msg, best_opposite) {
             self.emit_rejected(msg.order_id, msg.account_id, reason, recv_ts);
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
 
@@ -205,7 +334,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                 RejectReason::KillSwitched,
                 recv_ts,
             );
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
 
@@ -235,7 +364,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                 RejectReason::PostOnlyWouldCross,
                 recv_ts,
             );
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
 
@@ -421,8 +550,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                 }
             }
         }
-
-        self.emit_book_update_top(recv_ts);
+        // Book changes emitted in `step` after handler returns.
     }
 
     // -----------------------------------------------------------------
@@ -432,7 +560,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
     fn handle_cancel_order(&mut self, msg: CancelOrder, recv_ts: RecvTs) {
         if let Err(reason) = self.risk.check_cancel(&msg) {
             self.emit_rejected(msg.order_id, msg.account_id, reason, recv_ts);
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
         if self.risk.is_kill_switched() {
@@ -442,7 +570,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                 RejectReason::KillSwitched,
                 recv_ts,
             );
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
         if self.book.cancel(msg.order_id).is_ok() {
@@ -463,7 +591,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                 recv_ts,
             );
         }
-        self.emit_book_update_top(recv_ts);
+        // Book changes emitted in `step` after handler returns.
     }
 
     // -----------------------------------------------------------------
@@ -473,7 +601,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
     fn handle_cancel_replace(&mut self, msg: CancelReplace, recv_ts: RecvTs) {
         if let Err(reason) = self.risk.check_cancel_replace(&msg) {
             self.emit_rejected(msg.order_id, msg.account_id, reason, recv_ts);
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
         if self.risk.is_kill_switched() {
@@ -483,7 +611,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                 RejectReason::KillSwitched,
                 recv_ts,
             );
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
         // Snapshot the old registry entry so we can refund the old
@@ -526,7 +654,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                 recv_ts,
             ),
         }
-        self.emit_book_update_top(recv_ts);
+        // Book changes emitted in `step` after handler returns.
     }
 
     // -----------------------------------------------------------------
@@ -541,12 +669,12 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             // emission; the gateway pairs it with the inbound by
             // `recv_ts` rather than `order_id`.
             self.emit_rejected_mass(msg.account_id, reason, recv_ts);
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
         if self.risk.is_kill_switched() {
             self.emit_rejected_mass(msg.account_id, RejectReason::KillSwitched, recv_ts);
-            self.emit_book_update_top(recv_ts);
+            // Book updates emitted in `step` after the handler returns.
             return;
         }
         self.mass_buf.clear();
@@ -564,7 +692,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                 recv_ts,
             );
         }
-        self.emit_book_update_top(recv_ts);
+        // Book changes emitted in `step` after handler returns.
     }
 
     // -----------------------------------------------------------------

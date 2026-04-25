@@ -129,6 +129,160 @@ fn smoke_trade_print_emits_exactly_once_per_fill() {
 }
 
 #[test]
+fn smoke_l2_delta_emits_for_new_resting_level() {
+    let mut engine = Engine::new(
+        StubClock::new(1_000_000_000),
+        CounterIdGenerator::new(),
+        VecSink::new(),
+    );
+
+    engine.step(Inbound::NewOrder(limit_order(1, 7, Side::Bid, 100, 5)));
+    let events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    let l2_deltas: Vec<_> = events
+        .iter()
+        .filter_map(|o| match o {
+            Outbound::BookUpdateL2Delta(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(l2_deltas.len(), 1);
+    assert_eq!(l2_deltas[0].side, Side::Bid);
+    assert_eq!(l2_deltas[0].price.as_ticks(), 100);
+    assert_eq!(l2_deltas[0].new_qty.map(|q| q.as_lots()), Some(5));
+}
+
+#[test]
+fn smoke_l2_delta_emits_for_level_removed() {
+    let mut engine = Engine::new(
+        StubClock::new(1_000_000_000),
+        CounterIdGenerator::new(),
+        VecSink::new(),
+    );
+    engine.step(Inbound::NewOrder(limit_order(1, 7, Side::Bid, 100, 5)));
+    let _ = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+
+    use wire::inbound::CancelOrder;
+    engine.step(Inbound::CancelOrder(CancelOrder {
+        client_ts: ClientTs::new(0),
+        order_id: OrderId::new(1).expect("ok"),
+        account_id: AccountId::new(7).expect("ok"),
+    }));
+    let events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    let l2_deltas: Vec<_> = events
+        .iter()
+        .filter_map(|o| match o {
+            Outbound::BookUpdateL2Delta(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(l2_deltas.len(), 1);
+    assert_eq!(l2_deltas[0].side, Side::Bid);
+    assert_eq!(l2_deltas[0].price.as_ticks(), 100);
+    assert!(
+        l2_deltas[0].new_qty.is_none(),
+        "level removed = None new_qty"
+    );
+}
+
+#[test]
+fn smoke_l2_snapshot_plus_deltas_reconstruct_book_state() {
+    use std::collections::BTreeMap;
+    use wire::inbound::SnapshotRequest;
+    let mut engine = Engine::new(
+        StubClock::new(1_000_000_000),
+        CounterIdGenerator::new(),
+        VecSink::new(),
+    );
+
+    // Start with a populated book. Drain — these emissions are
+    // not part of the recovery test.
+    engine.step(Inbound::NewOrder(limit_order(1, 7, Side::Bid, 99, 5)));
+    engine.step(Inbound::NewOrder(limit_order(2, 7, Side::Bid, 100, 3)));
+    engine.step(Inbound::NewOrder(limit_order(3, 2, Side::Ask, 101, 4)));
+    engine.step(Inbound::NewOrder(limit_order(4, 2, Side::Ask, 102, 6)));
+    let _ = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+
+    // Snapshot the book — this is what a fresh subscriber would
+    // ingest at connect time.
+    engine.step(Inbound::SnapshotRequest(SnapshotRequest { request_id: 1 }));
+    let snap_events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    let snap = snap_events
+        .iter()
+        .find_map(|o| match o {
+            Outbound::SnapshotResponse(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("snapshot present");
+
+    // Build a `BTreeMap<(Side, Price), Qty>` from the snapshot.
+    let mut mirror: BTreeMap<(Side, i64), u64> = BTreeMap::new();
+    for level in &snap.bids {
+        mirror.insert((Side::Bid, level.price.as_ticks()), level.qty.as_lots());
+    }
+    for level in &snap.asks {
+        mirror.insert((Side::Ask, level.price.as_ticks()), level.qty.as_lots());
+    }
+
+    // Drive a few more steps (cross + cancel + new resting). Apply
+    // the captured L2 deltas to the mirror.
+    engine.step(Inbound::NewOrder(limit_order(99, 9, Side::Bid, 102, 2)));
+    let cross_events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    apply_deltas(&cross_events, &mut mirror);
+
+    use wire::inbound::CancelOrder;
+    engine.step(Inbound::CancelOrder(CancelOrder {
+        client_ts: ClientTs::new(0),
+        order_id: OrderId::new(1).expect("ok"),
+        account_id: AccountId::new(7).expect("ok"),
+    }));
+    let cancel_events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    apply_deltas(&cancel_events, &mut mirror);
+
+    engine.step(Inbound::NewOrder(limit_order(5, 7, Side::Bid, 95, 8)));
+    let add_events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    apply_deltas(&add_events, &mut mirror);
+
+    // Compare the mirror against a fresh snapshot of the engine.
+    engine.step(Inbound::SnapshotRequest(SnapshotRequest { request_id: 2 }));
+    let post_events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    let post_snap = post_events
+        .iter()
+        .find_map(|o| match o {
+            Outbound::SnapshotResponse(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("post snapshot");
+    let mut post_mirror: BTreeMap<(Side, i64), u64> = BTreeMap::new();
+    for level in &post_snap.bids {
+        post_mirror.insert((Side::Bid, level.price.as_ticks()), level.qty.as_lots());
+    }
+    for level in &post_snap.asks {
+        post_mirror.insert((Side::Ask, level.price.as_ticks()), level.qty.as_lots());
+    }
+
+    assert_eq!(
+        mirror, post_mirror,
+        "snapshot + N deltas must reconstruct the engine's book state"
+    );
+}
+
+fn apply_deltas(events: &[Outbound], mirror: &mut std::collections::BTreeMap<(Side, i64), u64>) {
+    for ev in events {
+        if let Outbound::BookUpdateL2Delta(d) = ev {
+            let key = (d.side, d.price.as_ticks());
+            match d.new_qty {
+                Some(q) => {
+                    mirror.insert(key, q.as_lots());
+                }
+                None => {
+                    mirror.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn smoke_snapshot_request_returns_book_levels_in_best_first_order() {
     use wire::inbound::SnapshotRequest;
     let mut engine = Engine::new(
