@@ -189,6 +189,12 @@ gen-fixture:
 smoke-bench:
 	cargo run --release --bin smoke_bench
 
+# Allocation count proof on the hot path (mechanical via dhat-rs).
+# Prints allocs/op and bytes/op after warmup. Documented in BENCH.md.
+.PHONY: dhat
+dhat:
+	cargo run --release --features hotpath-dhat --bin dhat_bench
+
 # Full bench (Criterion, default budget). Allow ~18 min wall-clock.
 .PHONY: bench-full
 bench-full:

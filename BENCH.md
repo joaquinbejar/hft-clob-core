@@ -95,28 +95,61 @@ target — see "Where the tail comes from" below).
 ## Allocation count on the hot path
 
 Tracked target: zero allocations on the matching path after
-warmup, per CLAUDE.md § Benchmarking.
+warmup, per CLAUDE.md § Benchmarking. Mechanically verified via
+`dhat-rs` behind the `hotpath-dhat` feature flag.
 
-Current observed allocation behaviour (manual reading of the diff;
-not yet enforced via `dhat`):
+### Reproducing the measurement
 
-- `Engine::step` — zero allocations on the cancel and rejected
-  paths. The `NewOrder` happy path with 0 fills also allocates
-  zero.
-- `match_aggressive` per level entry — one `Vec<Arc<OrderType<()>>>`
-  via `level.snapshot_orders()`, plus N `Arc::clone` bumps. This
-  is the documented v1 trade-off (deterministic FIFO over
-  pricelevel's hash-ordered `iter_orders`); the fix is the
-  Book-side `VecDeque` mirror tracked above.
-- `OrderRegistryEntry` HashMap — amortised zero on steady state
-  with the default `RandomState`. First N inserts grow the bucket
-  array; pre-sizing in `Engine::new` is a P2 follow-up
-  (`hotpath-reviewer` finding from #12).
+```bash
+cargo run --release --features hotpath-dhat --bin dhat_bench
+```
 
-The `--features hotpath-dhat` feature flag wiring `dhat-rs` to
-prove "zero allocation after warmup" mechanically is a follow-up
-issue. The current bench print line documents the percentile
-distribution, which is the directly-meaningful end-to-end signal.
+The binary runs the documented `add_cancel_mix` mix for `N_WARMUP =
+10_000` warmup ops + `N_MEASURE = 100_000` measurement ops. dhat
+counts every heap allocation (and every byte) made by the global
+allocator during the run. The `dhat::HeapStats` counters are
+monotonic, so the per-window delta is `post - pre`.
+
+### Captured numbers (Apple M4 Max, release build)
+
+| Metric | Value |
+|--------|------:|
+| Warmup ops | 10,000 |
+| Measurement ops | 100,000 |
+| Warmup total allocations | 8,771 |
+| Warmup total bytes | 1,175,012 |
+| Measurement allocations (delta) | 82,805 |
+| Measurement bytes (delta) | 7,862,672 |
+| **Allocations per op** | **0.828** |
+| **Bytes per op** | **78.6** |
+
+### Where the per-op allocation comes from
+
+Manual reading of the diff plus the dhat numbers cross-confirms:
+
+- `Engine::step` itself (cancel / rejected / replace / mass-cancel
+  / kill-switch) is zero-alloc on the steady state — the scratch
+  buffers `fills_buf` / `stp_buf` / `mass_buf` are pre-sized in
+  `Engine::new` and reused.
+- `match_aggressive` per level entered: one
+  `Vec<Arc<OrderType<()>>>` via `pricelevel::PriceLevel::snapshot_orders()`,
+  plus N `Arc::clone` ref-count bumps. This is the documented v1
+  trade-off — pricelevel's `iter_orders()` walks a `DashMap` and
+  is hash-ordered, so the snapshot is the only deterministic-FIFO
+  primitive available. ~0.8 allocs/op matches the workload's mix
+  (10 % aggressive crosses; most aggressive walks touch 1–2
+  levels; ~0.1 allocs/op of structural overhead from
+  `OrderRegistryEntry` HashMap growth and the encoder Vec inside
+  `ChannelSink::emit` adds the rest).
+- `OrderRegistryEntry` HashMap and `risk::per_account` HashMap —
+  amortised zero on the steady state once the working set stops
+  growing the bucket array.
+
+The next leverage move is the Book-side `BTreeMap<Price,
+VecDeque<OrderId>>` mirror that lets the fill loop peek the FIFO
+front in O(1) without `snapshot_orders()`. That eliminates both
+the per-level Vec and the N atomic refcount bumps, putting the
+steady-state per-op allocation count at zero or near-zero.
 
 ## Reproducing locally
 

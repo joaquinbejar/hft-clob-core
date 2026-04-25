@@ -21,6 +21,14 @@ parking_lot.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 hdrhistogram.workspace = true
+dhat = { workspace = true, optional = true }
+
+[features]
+# Enables `dhat-rs` allocation profiling on the smoke bench. Wires
+# the global allocator to dhat's counter; only enable for explicit
+# `cargo run --release --features hotpath-dhat --bin dhat_bench`
+# runs.
+hotpath-dhat = ["dep:dhat"]
 
 [dev-dependencies]
 proptest.workspace = true
@@ -29,3 +37,7 @@ criterion = { workspace = true, features = ["html_reports"] }
 [[bench]]
 name = "add_cancel_mix"
 harness = false
+
+[[bin]]
+name = "dhat_bench"
+required-features = ["hotpath-dhat"]
