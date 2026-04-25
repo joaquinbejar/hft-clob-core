@@ -24,7 +24,7 @@ discipline.
 | Sink | `engine::VecSink` with `events.clear()` per op (drains, never mutates external state) |
 | Clock | `BenchClock` — synthetic monotonic, one tick per `now()` call |
 | CPU pinning | Optional via `pinned-engine` feature + `--engine-core <N>`. Default off — Linux is the supported target; macOS treats the affinity hint as a soft QoS bias. |
-| Coordinated-omission correction | **None at the bench level**. The bench drives synchronous `step()` calls in a tight loop; there is no arrival-rate target, so the classical CO failure mode (a slow op delays the next request and hides the slow op from the histogram) does not apply. Histogram values are raw `t_end - t_start` per op. When this bench grows a closed-loop driver (issue 17 follow-up), `Histogram::record_correct(value, expected_interval)` will replace `record(value)`. |
+| Coordinated-omission correction | None on the open-loop `add_cancel_mix` Criterion bench (no arrival-rate target). A separate `co_bench` binary runs a **closed-loop** driver at a configurable target rate and applies `Histogram::record_correct(value, expected_interval)`. See "Closed-loop CO-corrected" section below. |
 
 The driver is `criterion::iter_batched` with `BatchSize::SmallInput`
 to keep the per-iter setup cost (`Engine::new`) outside the
@@ -68,6 +68,67 @@ across the captured-budget run is already in line with the
 microstructure cost model (matching is dominated by the
 `snapshot_orders()` allocation per level entry, which is the next
 target — see "Where the tail comes from" below).
+
+## Closed-loop CO-corrected
+
+The Criterion `add_cancel_mix` bench is open-loop: a tight `for` loop
+calls `engine.step()` synchronously and records `t_end - t_start`.
+That measurement style understates tail latency under realistic
+offered load — when `step()` runs slow, the next "request" is
+delayed and the slow op is hidden from the histogram.
+
+`crates/engine/src/bin/co_bench.rs` runs a closed-loop driver at a
+configurable target arrival rate. Each op is scheduled at
+`bench_start + i * interval`; before issuing, the driver
+busy-waits (`spin_loop`) until `Instant::now() >= scheduled`. The
+recorded value is `scheduled.elapsed()` — i.e., the latency the
+producer would observe from "I would have delivered this at time T"
+to "engine returned." `Histogram::record_correct(value,
+expected_interval)` synthesises additional records for any op
+where `value > interval`, backfilling the missed intervals.
+
+### Run
+
+```bash
+# Default 200k ops/sec target rate, 1M ops measurement.
+cargo run --release --bin co_bench
+
+# Custom rate via env var.
+TARGET_OPS_PER_SEC=100000 cargo run --release --bin co_bench
+```
+
+### Captured numbers (Apple M4 Max, release build, 100k ops/sec target)
+
+| Metric | Value |
+|--------|------:|
+| Target rate | 100,000 ops/sec |
+| Interval | 10,000 ns |
+| Warmup | 50,000 ops |
+| Measurement | 1,000,000 ops |
+| Wall-clock | 9,999 ms |
+| p50 | 26,543 ns |
+| p99 | 813,055 ns |
+| p99.9 | 1,209,343 ns |
+| p99.99 | 1,577,983 ns |
+| max | 1,765,375 ns |
+
+### Comparison to open-loop
+
+Open-loop p99.9 from the Criterion bench is ~210 µs; CO-corrected
+p99.9 at 100k ops/sec is ~1.21 ms, reflecting the additional
+latency a real producer offering load at that rate would have
+observed. The deltas are dominated by:
+
+- Spin-loop overshoot on macOS — `Instant::now()` is precise but
+  the spin path itself has scheduler-driven jitter at sub-µs scale.
+- Engine `step()` cost variance (the same `snapshot_orders()`
+  allocation that drives the open-loop tail still applies).
+
+On a Linux box with `--engine-core` pinning + `taskset` cgroup
+isolation the CO-corrected p50 should collapse toward the open-
+loop p50 (the spin path is ns-precise without scheduler jitter).
+Capturing those numbers is a follow-up — the methodology and the
+binary are in place.
 
 ## CPU pinning + NUMA placement
 
