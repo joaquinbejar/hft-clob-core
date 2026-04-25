@@ -93,7 +93,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn proptest_trade_id_strictly_monotonic(seed in 0u64..u64::MAX - 1) {
+        fn proptest_trade_id_strictly_monotonic(seed in 0u64..=u64::MAX - 1) {
             let t0 = TradeId::new(seed);
             let t1 = t0.next().expect("no overflow");
             prop_assert!(t1 > t0);

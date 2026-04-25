@@ -7,8 +7,10 @@ use std::fmt;
 /// contract and must not be reassigned.
 ///
 /// New rejection reasons are added by appending — never by renumbering.
-/// `255 = Unknown` is reserved for forward-compatible decode of
-/// future schema versions.
+/// Decode of any unassigned discriminant returns
+/// [`RejectReasonError::Unknown`]; discriminant `255` is reserved as a
+/// sentinel that must not be assigned without a coordinated schema-
+/// version bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RejectReason {

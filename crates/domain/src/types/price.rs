@@ -93,8 +93,10 @@ mod tests {
         type Parameters = ();
         type Strategy = BoxedStrategy<Self>;
         fn arbitrary_with(_: ()) -> Self::Strategy {
+            // Generate as a multiple of TICK_SIZE so the strategy stays
+            // valid the moment a future PR raises TICK_SIZE above 1.
             (1i64..=1_000_000)
-                .prop_map(|v| Price::new(v).expect("strategy yields valid Price"))
+                .prop_map(|n| Price::new(n * TICK_SIZE).expect("strategy yields valid Price"))
                 .boxed()
         }
     }
@@ -110,8 +112,8 @@ mod tests {
     }
 
     #[test]
-    fn test_price_new_one_returns_ok() {
-        assert!(Price::new(1).is_ok());
+    fn test_price_new_one_tick_returns_ok() {
+        assert!(Price::new(TICK_SIZE).is_ok());
     }
 
     #[test]

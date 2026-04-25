@@ -1,8 +1,10 @@
 //! Workspace-wide named constants.
 //!
-//! No magic numbers anywhere else in the workspace — every literal traces
-//! back to one of these constants. CLAUDE.md is explicit: `TICK_SIZE` and
-//! `LOT_SIZE` live in `domain::consts`.
+//! Every constant that appears in domain validation, risk policy, or
+//! matching logic lives here — `TICK_SIZE`, `LOT_SIZE`, `PRICE_BAND_BPS`,
+//! account limits, and the venue symbol. Buffer sizes, frame headers,
+//! and other purely-mechanical literals stay close to the code that
+//! uses them; they are not policy and do not belong here.
 
 /// Smallest legal price increment, expressed as a raw tick count.
 ///

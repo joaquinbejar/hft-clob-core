@@ -9,8 +9,8 @@
 //!   integers (`i64` for `Price`, `u64` for `Qty`). No `f32` / `f64`
 //!   anywhere in this crate.
 //! - Named constants for tick size, lot size, price band, and account
-//!   limits — see [`consts`]. No magic numbers anywhere else in the
-//!   workspace.
+//!   limits — see [`consts`]. Domain validation, risk policy, and
+//!   matching logic refer to these names rather than to bare literals.
 //! - Domain newtypes (`Price`, `Qty`, `OrderId`, `AccountId`,
 //!   `EngineSeq`, `TradeId`, `ClientTs`, `RecvTs`) enforce type safety
 //!   at every boundary.

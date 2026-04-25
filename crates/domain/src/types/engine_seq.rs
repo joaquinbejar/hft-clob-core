@@ -100,7 +100,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn proptest_engine_seq_strictly_monotonic(seed in 0u64..u64::MAX - 1) {
+        fn proptest_engine_seq_strictly_monotonic(seed in 0u64..=u64::MAX - 1) {
             let s0 = EngineSeq::new(seed);
             let s1 = s0.next().expect("no overflow");
             prop_assert!(s1 > s0);

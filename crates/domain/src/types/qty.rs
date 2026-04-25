@@ -91,8 +91,10 @@ mod tests {
         type Parameters = ();
         type Strategy = BoxedStrategy<Self>;
         fn arbitrary_with(_: ()) -> Self::Strategy {
+            // Generate as a multiple of LOT_SIZE so the strategy stays
+            // valid the moment a future PR raises LOT_SIZE above 1.
             (1u64..=1_000_000)
-                .prop_map(|v| Qty::new(v).expect("strategy yields valid Qty"))
+                .prop_map(|n| Qty::new(n * LOT_SIZE).expect("strategy yields valid Qty"))
                 .boxed()
         }
     }
@@ -103,8 +105,8 @@ mod tests {
     }
 
     #[test]
-    fn test_qty_new_one_returns_ok() {
-        assert!(Qty::new(1).is_ok());
+    fn test_qty_new_one_lot_returns_ok() {
+        assert!(Qty::new(LOT_SIZE).is_ok());
     }
 
     #[test]
