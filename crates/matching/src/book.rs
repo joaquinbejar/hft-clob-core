@@ -10,34 +10,35 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use domain::{IdGenerator, OrderId, Price, Qty, Side};
+use domain::{AccountId, IdGenerator, OrderId, Price, Qty, Side};
 use pricelevel::{
     Hash32, Id as PlId, OrderType as PlOrderType, OrderUpdate as PlOrderUpdate, Price as PlPrice,
     PriceLevel, Quantity as PlQuantity, Side as PlSide, TimeInForce as PlTif, TimestampMs,
-    UuidGenerator,
 };
-use uuid::Uuid;
 
 use crate::error::BookError;
-use crate::fill::{AggressiveOrder, Fill, MatchResult};
+use crate::fill::{AggressiveOrder, Fill, MatchResult, StpCancellation};
 
-/// Namespace UUID for `pricelevel::UuidGenerator`. Pricelevel needs a
-/// generator instance to call `match_order`, but its returned trade
-/// ids are discarded — our own `domain::TradeId` comes from the
-/// injected `IdGenerator`. A fixed namespace keeps the generator's
-/// internal state deterministic, which matters for any pricelevel
-/// behaviour gated on it.
-const PL_NAMESPACE: Uuid = Uuid::nil();
+/// Sidecar entry per resting order: every field the cancel /
+/// match-walk paths read in O(1) without iterating the price index.
+#[derive(Debug, Clone, Copy)]
+struct OrderMeta {
+    side: Side,
+    price: Price,
+    account_id: AccountId,
+}
 
 /// A resting-order request handed to [`Book::add_resting`].
 ///
-/// `Book` does not currently retain `account_id` or other engine-side
-/// metadata — that arrives with the engine pipeline (issue #12). The
-/// sidecar index here only carries `(Side, Price)` per the issue task.
+/// Carries the `account_id` so self-trade prevention can detect a
+/// same-account maker / taker pairing inside the fill loop without
+/// having to bounce through a separate lookup table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestingOrder {
     /// Client-assigned identifier.
     pub order_id: OrderId,
+    /// Account binding.
+    pub account_id: AccountId,
     /// Buy / sell.
     pub side: Side,
     /// Limit price.
@@ -57,20 +58,15 @@ pub struct Book {
     bids: BTreeMap<Price, Arc<PriceLevel>>,
     asks: BTreeMap<Price, Arc<PriceLevel>>,
     /// Lookup-only — never iterated into outputs. Maps every resting
-    /// `OrderId` to its `(Side, Price)` so cancel is O(log n) on the
-    /// price index plus O(1) inside the level.
-    index: HashMap<OrderId, (Side, Price)>,
+    /// `OrderId` to its `OrderMeta` (side / price / account_id) so
+    /// cancel is O(log n) on the price index plus O(1) inside the
+    /// level, and STP detection inside the fill loop is also O(1).
+    index: HashMap<OrderId, OrderMeta>,
     /// Strictly increasing per-order arrival counter, used as the
     /// `pricelevel::TimestampMs` for each inserted order. Internal
     /// monotonic — does NOT read the wall clock. CLAUDE.md forbids
     /// any wall-clock read inside `crates/matching/`.
     seq: u64,
-    /// Pricelevel's `match_order` requires a `UuidGenerator` to stamp
-    /// its internal `Trade` records. The generated ids are discarded
-    /// at the matching boundary; our `domain::TradeId` comes from the
-    /// injected `IdGenerator` per emitted [`Fill`]. Held here to avoid
-    /// constructing a fresh one per call.
-    pl_uuid_gen: UuidGenerator,
 }
 
 impl Book {
@@ -82,7 +78,6 @@ impl Book {
             asks: BTreeMap::new(),
             index: HashMap::new(),
             seq: 0,
-            pl_uuid_gen: UuidGenerator::new(PL_NAMESPACE),
         }
     }
 
@@ -137,7 +132,14 @@ impl Book {
             .or_insert_with(|| Arc::new(PriceLevel::new(price_u128)))
             .add_order(pl_order);
 
-        self.index.insert(order.order_id, (order.side, order.price));
+        self.index.insert(
+            order.order_id,
+            OrderMeta {
+                side: order.side,
+                price: order.price,
+                account_id: order.account_id,
+            },
+        );
         Ok(())
     }
 
@@ -154,7 +156,9 @@ impl Book {
         // book is already corrupt (sidecar / price index out of sync),
         // but at least the sidecar entry stays in place so a retry can
         // see the same view rather than a partially-rolled-back state.
-        let (side, price) = *self.index.get(&order_id).ok_or(BookError::UnknownOrderId)?;
+        let meta = *self.index.get(&order_id).ok_or(BookError::UnknownOrderId)?;
+        let side = meta.side;
+        let price = meta.price;
         let levels = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
@@ -182,8 +186,8 @@ impl Book {
 
     /// Walk the opposite side of the book best-price-first, consuming
     /// resting orders FIFO at each level until the taker is filled,
-    /// the next level no longer crosses, or no more orders remain.
-    /// Each fill is appended to `out_buf`.
+    /// the next level no longer crosses, no more orders remain, or
+    /// self-trade prevention fires on a same-account maker.
     ///
     /// `taker.side == Side::Bid` walks the asks ascending (best ask
     /// first). `taker.side == Side::Ask` walks the bids descending.
@@ -192,40 +196,57 @@ impl Book {
     /// that does not cross (`asks_price > p` for a buy taker,
     /// `bids_price < p` for a sell taker).
     ///
+    /// **Self-trade prevention (cancel-both, per `doc/DESIGN.md` §
+    /// 5.2).** Before crossing each maker the loop reads its
+    /// `account_id` from the sidecar. When the maker belongs to the
+    /// taker's account, both sides are dropped: the maker is
+    /// cancelled (an [`StpCancellation`] record is appended to
+    /// `out_stp` and the level / sidecar are updated), the walk
+    /// halts, and `MatchResult::taker_stp_cancelled` is set so the
+    /// engine pipeline emits `Cancelled{SelfTradePrevented}` for the
+    /// taker rather than resting it. STP fires after risk checks
+    /// (CLAUDE.md § 7) and before the actual cross — fills emitted
+    /// during the walk up to the STP point are kept; the STP cuts
+    /// further crossing.
+    ///
     /// CLAUDE.md invariants honoured by construction:
     ///
     /// - Levels are picked via `BTreeMap::first_key_value` /
     ///   `last_key_value`; iteration is sorted by price, deterministic.
-    /// - `pricelevel::PriceLevel::match_order` provides strict FIFO
-    ///   within a level; we discard its internal trade ids and the
-    ///   wall-clock-stamped timestamp on `pricelevel::Trade`.
+    /// - Strict FIFO within a level — `pricelevel::PriceLevel`'s
+    ///   internal `crossbeam::SegQueue` is iterated head-first via
+    ///   `iter_orders` and mutated through `update_order`.
     /// - Every emitted [`Fill`] has `price == maker_level_price`.
     /// - Every [`Fill`] is one maker (`maker_order_id`) and one taker
     ///   (`taker_order_id`) — structural in the type.
+    /// - No wall-clock reads, no randomness, no hash-based iteration
+    ///   reaching outputs.
     ///
-    /// Returns a [`MatchResult`] summarising how many fills were
-    /// appended and how much taker qty remains.
+    /// Returns a [`MatchResult`] summarising how many fills + STP
+    /// cancellations were appended, the taker's remaining qty, and
+    /// whether the walk halted on STP.
     #[inline]
     pub fn match_aggressive<I: IdGenerator>(
         &mut self,
         taker: AggressiveOrder,
         ids: &mut I,
-        out_buf: &mut Vec<Fill>,
+        out_fills: &mut Vec<Fill>,
+        out_stp: &mut Vec<StpCancellation>,
     ) -> MatchResult {
-        let initial_buf_len = out_buf.len();
+        let initial_fills_len = out_fills.len();
+        let initial_stp_len = out_stp.len();
         let mut remaining = taker.qty.as_lots();
+        let mut taker_stp_cancelled = false;
 
-        while remaining > 0 {
+        'walk: while remaining > 0 {
             // Pick the best opposite-side level price.
             let level_price = match taker.side {
-                // Bid taker walks asks ascending → best ask is lowest.
                 Side::Bid => self.asks.keys().next().copied(),
-                // Ask taker walks bids descending → best bid is highest.
                 Side::Ask => self.bids.keys().next_back().copied(),
             };
             let level_price = match level_price {
                 Some(p) => p,
-                None => break, // opposite side empty
+                None => break,
             };
 
             // Limit-price gate. `None` is a market order and always crosses.
@@ -239,90 +260,113 @@ impl Book {
                 }
             }
 
-            // Fetch the level (immutable borrow on the BTreeMap).
+            // Fetch the level (Arc::clone so the BTreeMap can be
+            // mutably re-borrowed below for empty-level pruning).
             let level_arc = match taker.side {
                 Side::Bid => self.asks.get(&level_price),
                 Side::Ask => self.bids.get(&level_price),
             };
-            // Should always be `Some` because we just picked the key
-            // out of the same BTreeMap; defensive `break` rather than
-            // panic if the invariant ever drifts.
             let level_arc = match level_arc {
                 Some(l) => Arc::clone(l),
                 None => break,
             };
 
-            // Consume up to `remaining` qty from this level. Pricelevel
-            // does the FIFO walk, atomic decrements, and returns trade
-            // records and the ids of fully-consumed makers. We discard
-            // its internal trade ids and timestamps; our own come from
-            // the injected `IdGenerator`.
-            let pl_taker_id = PlId::Sequential(taker.order_id.as_raw());
-            let pl_result = level_arc.match_order(remaining, pl_taker_id, &self.pl_uuid_gen);
+            // Walk this level's queue head-first. STP is checked per
+            // head: the first same-account maker we hit cancels both
+            // sides and halts the walk. Otherwise the head is filled
+            // (partial or full) via `update_order` and the next head
+            // becomes the new front.
+            'level: loop {
+                if remaining == 0 {
+                    break 'level;
+                }
+                // Peek the queue head. `iter_orders` is FIFO under
+                // single-writer (the matching core is single-writer
+                // per CLAUDE.md), so the first item is the oldest
+                // resting order at this price.
+                let head = match level_arc.iter_orders().next() {
+                    Some(h) => h,
+                    None => break 'level,
+                };
+                let head_pl_id = head.id();
+                let head_order_id = pl_id_to_domain(head_pl_id);
+                let head_meta = match self.index.get(&head_order_id) {
+                    Some(m) => *m,
+                    None => {
+                        // Sidecar / level out of sync — defensive halt.
+                        break 'walk;
+                    }
+                };
 
-            // Build domain `Fill`s out of the trade records. The
-            // `filled_order_ids` tell us which makers were fully
-            // consumed; pricelevel guarantees that vector is in trade
-            // order (one push per fully-consumed maker, in pop
-            // sequence). A single cursor advances the filled-list as
-            // we walk trades, collapsing what would otherwise be an
-            // O(T·F) `contains` to O(T+F) with no allocations.
-            let trades = pl_result.trades();
-            let filled = pl_result.filled_order_ids();
-            let new_remaining = pl_result.remaining_quantity();
+                // STP gate. Cancel-both: drop the maker, halt the
+                // walk, signal taker cancel.
+                if head_meta.account_id == taker.account_id {
+                    let head_qty_raw = head.visible_quantity();
+                    let head_qty = Qty::new(head_qty_raw).unwrap_or(Qty::MIN);
+                    debug_assert!(head_qty_raw > 0, "resting order with zero qty");
+                    let _ = level_arc.update_order(PlOrderUpdate::Cancel {
+                        order_id: head_pl_id,
+                    });
+                    self.index.remove(&head_order_id);
+                    out_stp.push(StpCancellation {
+                        order_id: head_order_id,
+                        account_id: head_meta.account_id,
+                        side: head_meta.side,
+                        price: level_price,
+                        qty: head_qty,
+                    });
+                    taker_stp_cancelled = true;
+                    // The STP cancel may have emptied the level. Clean
+                    // up the BTreeMap entry before halting so a follow-
+                    // up `best_*` / `match_aggressive` sees the right
+                    // view.
+                    if level_arc.order_count() == 0 {
+                        let _ = match taker.side {
+                            Side::Bid => self.asks.remove(&level_price),
+                            Side::Ask => self.bids.remove(&level_price),
+                        };
+                    }
+                    break 'walk;
+                }
 
-            // Pre-reserve capacity so a single deep level walk grows
-            // `out_buf` at most once instead of letting `push` grow
-            // geometrically.
-            let trades_slice = trades.as_vec();
-            out_buf.reserve(trades_slice.len());
+                // Normal fill against this maker.
+                let head_qty_raw = head.visible_quantity();
+                if head_qty_raw == 0 {
+                    debug_assert!(false, "pricelevel queue head has zero qty");
+                    break 'walk;
+                }
+                let fill_qty_raw = remaining.min(head_qty_raw);
+                let new_head_qty_raw = head_qty_raw - fill_qty_raw;
+                let maker_fully_filled = new_head_qty_raw == 0;
 
-            let mut filled_cursor: usize = 0;
-            for trade in trades_slice.iter() {
-                let maker_pl_id = trade.maker_order_id();
-                let q = trade.quantity().as_u64();
-                // Pricelevel must emit only non-zero qty trades. Validate
-                // before allocating a trade_id; invalid qty halts the walk.
-                let Ok(qty) = Qty::new(q) else {
-                    debug_assert!(false, "pricelevel emitted zero-qty trade");
-                    break;
+                if maker_fully_filled {
+                    let _ = level_arc.update_order(PlOrderUpdate::Cancel {
+                        order_id: head_pl_id,
+                    });
+                    self.index.remove(&head_order_id);
+                } else {
+                    let _ = level_arc.update_order(PlOrderUpdate::UpdateQuantity {
+                        order_id: head_pl_id,
+                        new_quantity: PlQuantity::new(new_head_qty_raw),
+                    });
+                }
+
+                let Ok(fill_qty) = Qty::new(fill_qty_raw) else {
+                    debug_assert!(false, "fill_qty_raw==0 should be unreachable");
+                    break 'walk;
                 };
                 let trade_id = ids.next_trade_id();
-                let maker_order_id = pl_id_to_domain(maker_pl_id);
-
-                // Maker is fully filled iff it's the next one in the
-                // pricelevel-ordered `filled` slice.
-                let maker_fully_filled = filled
-                    .get(filled_cursor)
-                    .is_some_and(|id| *id == maker_pl_id);
-                if maker_fully_filled {
-                    filled_cursor += 1;
-                }
-
-                out_buf.push(Fill {
+                out_fills.push(Fill {
                     trade_id,
-                    maker_order_id,
+                    maker_order_id: head_order_id,
                     taker_order_id: taker.order_id,
-                    // Pricelevel reports the taker side on each Trade;
-                    // the maker side is the opposite of the taker.
                     maker_side: taker.side.opposite(),
                     price: level_price,
-                    qty,
+                    qty: fill_qty,
                     maker_fully_filled,
                 });
+                remaining -= fill_qty_raw;
             }
-
-            // Sidecar cleanup: every fully-consumed maker drops out of
-            // the lookup index.
-            for id in filled.iter() {
-                if let PlId::Sequential(raw) = *id
-                    && let Ok(order_id) = OrderId::new(raw)
-                {
-                    self.index.remove(&order_id);
-                }
-            }
-
-            remaining = new_remaining;
 
             // If the level is now empty, remove it from the price
             // index so `best_*` and the next walk see the right view.
@@ -331,18 +375,14 @@ impl Book {
                     Side::Bid => self.asks.remove(&level_price),
                     Side::Ask => self.bids.remove(&level_price),
                 };
-            } else if remaining > 0 {
-                // The level still has resting orders but pricelevel
-                // returned without filling more. Defensive break to
-                // avoid an infinite loop on an unexpected pricelevel
-                // state — shouldn't fire in practice.
-                break;
             }
         }
 
         MatchResult {
-            fills_count: out_buf.len() - initial_buf_len,
+            fills_count: out_fills.len() - initial_fills_len,
+            stp_cancellations: out_stp.len() - initial_stp_len,
             taker_remaining: Qty::new(remaining).ok(),
+            taker_stp_cancelled,
         }
     }
 
@@ -415,8 +455,13 @@ mod tests {
     use super::*;
 
     fn order(id: u64, side: Side, price: i64, qty: u64) -> RestingOrder {
+        order_acct(id, /* default account */ 1, side, price, qty)
+    }
+
+    fn order_acct(id: u64, account: u32, side: Side, price: i64, qty: u64) -> RestingOrder {
         RestingOrder {
             order_id: OrderId::new(id).expect("valid order_id fixture"),
+            account_id: AccountId::new(account).expect("valid account_id fixture"),
             side,
             price: Price::new(price).expect("valid price fixture"),
             qty: Qty::new(qty).expect("valid qty fixture"),
@@ -574,7 +619,9 @@ mod tests {
             for (i, (side, price, qty)) in orders.iter().enumerate() {
                 let id = OrderId::new((i as u64) + 1).expect("ok");
                 let added = book.add_resting(RestingOrder {
-                    order_id: id, side: *side, price: *price, qty: *qty
+                    order_id: id,
+                    account_id: AccountId::new(1).expect("ok"),
+                    side: *side, price: *price, qty: *qty
                 });
                 if added.is_ok() {
                     ids.push(id);
@@ -636,12 +683,31 @@ mod tests {
     }
 
     fn taker(id: u64, side: Side, price: Option<i64>, qty: u64) -> AggressiveOrder {
+        taker_acct(id, /* default account */ 99, side, price, qty)
+    }
+
+    fn taker_acct(
+        id: u64,
+        account: u32,
+        side: Side,
+        price: Option<i64>,
+        qty: u64,
+    ) -> AggressiveOrder {
         AggressiveOrder {
             order_id: OrderId::new(id).expect("ok"),
+            account_id: AccountId::new(account).expect("ok"),
             side,
             price: price.map(|p| Price::new(p).expect("ok")),
             qty: Qty::new(qty).expect("ok"),
+            tif: domain::Tif::Gtc,
         }
+    }
+
+    /// Helper to build the auxiliary STP buffer required by the
+    /// 4-arg `match_aggressive` signature. Tests that don't expect
+    /// STP can ignore the second `Vec` after the call.
+    fn stp_buf() -> Vec<StpCancellation> {
+        Vec::new()
     }
 
     #[test]
@@ -649,7 +715,13 @@ mod tests {
         let mut book = Book::new();
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
-        let r = book.match_aggressive(taker(1, Side::Bid, Some(100), 10), &mut ids, &mut buf);
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker(1, Side::Bid, Some(100), 10),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 0);
         assert_eq!(r.taker_remaining, Some(Qty::new(10).expect("ok")));
         assert!(buf.is_empty());
@@ -661,7 +733,13 @@ mod tests {
         book.add_resting(order(1, Side::Ask, 100, 10)).expect("add");
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
-        let r = book.match_aggressive(taker(2, Side::Bid, Some(100), 10), &mut ids, &mut buf);
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker(2, Side::Bid, Some(100), 10),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 1);
         assert_eq!(r.taker_remaining, None);
         assert_eq!(buf.len(), 1);
@@ -682,8 +760,14 @@ mod tests {
         book.add_resting(order(1, Side::Ask, 100, 5)).expect("add");
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
+        let mut stp = stp_buf();
         // Taker wants 10 but only 5 resting at any crossing price.
-        let r = book.match_aggressive(taker(2, Side::Bid, Some(100), 10), &mut ids, &mut buf);
+        let r = book.match_aggressive(
+            taker(2, Side::Bid, Some(100), 10),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 1);
         assert_eq!(r.taker_remaining, Some(Qty::new(5).expect("ok")));
         assert_eq!(buf[0].qty, Qty::new(5).expect("ok"));
@@ -698,7 +782,13 @@ mod tests {
         book.add_resting(order(2, Side::Ask, 100, 5)).expect("add");
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
-        let r = book.match_aggressive(taker(3, Side::Bid, Some(110), 8), &mut ids, &mut buf);
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker(3, Side::Bid, Some(110), 8),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 2);
         assert_eq!(r.taker_remaining, None);
         // First fill at the better (lower) ask price.
@@ -719,8 +809,14 @@ mod tests {
         book.add_resting(order(2, Side::Ask, 105, 5)).expect("add");
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
+        let mut stp = stp_buf();
         // Taker price 100 only crosses the 100 level, not 105.
-        let r = book.match_aggressive(taker(3, Side::Bid, Some(100), 10), &mut ids, &mut buf);
+        let r = book.match_aggressive(
+            taker(3, Side::Bid, Some(100), 10),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 1);
         assert_eq!(r.taker_remaining, Some(Qty::new(5).expect("ok")));
         assert_eq!(buf[0].price, Price::new(100).expect("ok"));
@@ -737,7 +833,10 @@ mod tests {
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
         // None price = market order; sweeps until book empty or filled.
-        let r = book.match_aggressive(taker(4, Side::Bid, None, 100), &mut ids, &mut buf);
+        let r = {
+            let mut s = stp_buf();
+            book.match_aggressive(taker(4, Side::Bid, None, 100), &mut ids, &mut buf, &mut s)
+        };
         assert_eq!(r.fills_count, 3);
         assert_eq!(r.taker_remaining, Some(Qty::new(91).expect("ok"))); // 100 - 9 filled
         assert!(book.best_ask().is_none());
@@ -750,7 +849,13 @@ mod tests {
         book.add_resting(order(2, Side::Ask, 100, 5)).expect("add");
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
-        let r = book.match_aggressive(taker(3, Side::Bid, Some(300), 5), &mut ids, &mut buf);
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker(3, Side::Bid, Some(300), 5),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 1);
         // Lower ask hit first.
         assert_eq!(buf[0].price, Price::new(100).expect("ok"));
@@ -763,7 +868,13 @@ mod tests {
         book.add_resting(order(2, Side::Bid, 100, 5)).expect("add");
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
-        let r = book.match_aggressive(taker(3, Side::Ask, Some(40), 5), &mut ids, &mut buf);
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker(3, Side::Ask, Some(40), 5),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 1);
         // Higher bid hit first.
         assert_eq!(buf[0].price, Price::new(100).expect("ok"));
@@ -776,7 +887,13 @@ mod tests {
         book.add_resting(order(2, Side::Ask, 100, 5)).expect("add");
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
-        let r = book.match_aggressive(taker(3, Side::Bid, Some(100), 10), &mut ids, &mut buf);
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker(3, Side::Bid, Some(100), 10),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 2);
         assert_eq!(r.taker_remaining, None);
         // Both makers fully filled — sidecar should not retain them;
@@ -798,7 +915,13 @@ mod tests {
         book.add_resting(order(2, Side::Ask, 110, 3)).expect("add");
         let mut ids = MockIds::new();
         let mut buf = Vec::new();
-        let r = book.match_aggressive(taker(3, Side::Bid, Some(120), 6), &mut ids, &mut buf);
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker(3, Side::Bid, Some(120), 6),
+            &mut ids,
+            &mut buf,
+            &mut stp,
+        );
         assert_eq!(r.fills_count, 2);
         assert_eq!(buf[0].trade_id, TradeId::new(1));
         assert_eq!(buf[1].trade_id, TradeId::new(2));
@@ -822,10 +945,12 @@ mod tests {
             }
             let mut ids = MockIds::new();
             let mut buf = Vec::new();
+            let mut stp = stp_buf();
             book.match_aggressive(
                 taker(9999, Side::Bid, None, taker_qty),
                 &mut ids,
                 &mut buf,
+                &mut stp,
             );
             for fill in &buf {
                 let expected_price =
@@ -849,14 +974,133 @@ mod tests {
             }
             let mut ids = MockIds::new();
             let mut buf = Vec::new();
+            let mut stp = stp_buf();
             book.match_aggressive(
                 taker(9999, Side::Bid, None, 1_000_000),
                 &mut ids,
                 &mut buf,
+                &mut stp,
             );
             for fill in &buf {
                 prop_assert_ne!(fill.maker_order_id, fill.taker_order_id);
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Self-trade prevention (cancel-both)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_stp_same_account_first_maker_cancels_both() {
+        // Account 7 has both a resting ask at 100 (qty 5) and a buy
+        // taker for 5 — the only candidate maker is the same account.
+        // STP must drop the maker, halt the walk, and signal taker
+        // cancel; the buy must NOT fill.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, /* acct */ 7, Side::Ask, 100, 5))
+            .expect("add");
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker_acct(2, /* acct */ 7, Side::Bid, Some(100), 5),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        assert_eq!(r.fills_count, 0);
+        assert_eq!(r.stp_cancellations, 1);
+        assert!(r.taker_stp_cancelled);
+        assert_eq!(r.taker_remaining, Some(Qty::new(5).expect("ok")));
+        assert_eq!(stp[0].order_id, OrderId::new(1).expect("ok"));
+        assert_eq!(stp[0].account_id, AccountId::new(7).expect("ok"));
+        assert_eq!(stp[0].price, Price::new(100).expect("ok"));
+        assert_eq!(stp[0].qty, Qty::new(5).expect("ok"));
+        // Maker dropped from book.
+        assert!(book.best_ask().is_none());
+        // Sidecar cleaned.
+        assert_eq!(
+            book.cancel(OrderId::new(1).expect("ok")),
+            Err(BookError::UnknownOrderId)
+        );
+    }
+
+    #[test]
+    fn test_stp_after_partial_fill_against_other_account() {
+        // Asks (FIFO order at price 100): order 1 acct B (qty 3),
+        // order 2 acct A (qty 5). Buy taker acct A for 10.
+        // Walk fills 3 from order 1 (acct B), then hits order 2
+        // (acct A) → STP. Result: 1 fill, 1 STP, taker cancelled.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, /* acct */ 2, Side::Ask, 100, 3))
+            .expect("add");
+        book.add_resting(order_acct(2, /* acct */ 7, Side::Ask, 100, 5))
+            .expect("add");
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker_acct(99, /* acct */ 7, Side::Bid, Some(100), 10),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        assert_eq!(r.fills_count, 1);
+        assert_eq!(r.stp_cancellations, 1);
+        assert!(r.taker_stp_cancelled);
+        assert_eq!(fills[0].maker_order_id, OrderId::new(1).expect("ok"));
+        assert_eq!(fills[0].qty, Qty::new(3).expect("ok"));
+        assert_eq!(stp[0].order_id, OrderId::new(2).expect("ok"));
+        // Taker had 10, 3 filled, 7 remaining at STP.
+        assert_eq!(r.taker_remaining, Some(Qty::new(7).expect("ok")));
+    }
+
+    #[test]
+    fn test_stp_no_fire_when_different_accounts() {
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 2, Side::Ask, 100, 5))
+            .expect("add");
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker_acct(2, 7, Side::Bid, Some(100), 5),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        assert_eq!(r.fills_count, 1);
+        assert_eq!(r.stp_cancellations, 0);
+        assert!(!r.taker_stp_cancelled);
+        assert!(r.taker_remaining.is_none()); // fully filled
+        assert!(stp.is_empty());
+    }
+
+    #[test]
+    fn test_stp_cancels_first_same_account_skips_remaining_levels() {
+        // Bid taker on acct A. Asks: 100 acct A (qty 1), 105 acct B (qty 5).
+        // Even though 105 has a different-account maker that would also
+        // cross, STP at 100 halts the walk — cancel-both stops the taker.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 7, Side::Ask, 100, 1))
+            .expect("add");
+        book.add_resting(order_acct(2, 2, Side::Ask, 105, 5))
+            .expect("add");
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        let r = book.match_aggressive(
+            taker_acct(3, 7, Side::Bid, Some(110), 6),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        assert_eq!(r.fills_count, 0);
+        assert_eq!(r.stp_cancellations, 1);
+        assert!(r.taker_stp_cancelled);
+        // 105 level untouched — different-account maker still resting.
+        assert_eq!(book.best_ask(), Some(Price::new(105).expect("ok")));
+        assert_eq!(book.side_qty(Side::Ask), 5);
     }
 }

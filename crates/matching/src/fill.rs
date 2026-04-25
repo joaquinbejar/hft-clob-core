@@ -1,6 +1,6 @@
 //! Aggressive-order request / fill output / match summary types.
 
-use domain::{OrderId, Price, Qty, Side, TradeId};
+use domain::{AccountId, OrderId, Price, Qty, Side, Tif, TradeId};
 
 /// Request handed to [`crate::Book::match_aggressive`].
 ///
@@ -10,12 +10,22 @@ use domain::{OrderId, Price, Qty, Side, TradeId};
 pub struct AggressiveOrder {
     /// Client-assigned identifier for the aggressor.
     pub order_id: OrderId,
+    /// Aggressor's account binding. Used by self-trade prevention to
+    /// detect a same-account maker / taker pairing inside the fill
+    /// loop (CLAUDE.md § Architecture: STP fires after risk checks
+    /// and before the actual cross).
+    pub account_id: AccountId,
     /// Taker side.
     pub side: Side,
     /// Limit price cap. `None` means market order — always crosses.
     pub price: Option<Price>,
     /// Order quantity.
     pub qty: Qty,
+    /// Time-in-force policy. The fill loop itself does not consume
+    /// `tif` — the engine pipeline reads it after `match_aggressive`
+    /// returns to decide whether the leftover qty rests (`Gtc`) or
+    /// cancels (`Ioc`). `PostOnly` would-cross detection lives in #10.
+    pub tif: Tif,
 }
 
 /// One fill event produced by the fill loop.
@@ -54,20 +64,51 @@ pub struct Fill {
     pub maker_fully_filled: bool,
 }
 
+/// One self-trade-prevention cancellation. Emitted by the fill loop
+/// when the next maker on the queue belongs to the taker's own
+/// account; both sides are dropped per the cancel-both policy
+/// (`doc/DESIGN.md` § 5.2). The engine pipeline emits a
+/// `Cancelled{SelfTradePrevented}` exec report for the maker carrying
+/// this record, plus a separate cancel for the taker (signalled by
+/// [`MatchResult::taker_stp_cancelled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StpCancellation {
+    /// Resting maker that was dropped.
+    pub order_id: OrderId,
+    /// Account that owns the dropped maker (always equal to the
+    /// taker's account, by definition of STP).
+    pub account_id: AccountId,
+    /// Maker side (taker is on the opposite side).
+    pub side: Side,
+    /// Maker's resting price.
+    pub price: Price,
+    /// Maker's residual qty at the time of cancellation.
+    pub qty: Qty,
+}
+
 /// Summary of one [`crate::Book::match_aggressive`] call.
 ///
 /// `fills_count` is the number of [`Fill`] entries the call **wrote
 /// into the caller's `out_buf`**, starting at the buffer's existing
-/// length. `taker_remaining` is the leftover qty after the walk:
-/// `None` means the taker was fully consumed (terminal `Filled` from the
-/// engine's perspective). `Some(qty)` is a non-zero qty that lets the
-/// engine apply TIF semantics (rest as `Gtc`, cancel for `Ioc`, etc.) —
-/// that policy lives in issue #8.
+/// length. `stp_cancellations` is the count of [`StpCancellation`]
+/// entries appended to the caller's `out_stp` buffer. `taker_remaining`
+/// is the leftover qty after the walk: `None` means the taker was
+/// fully consumed; `Some(qty)` carries the leftover. `taker_stp_cancelled`
+/// is `true` when the walk halted on a self-trade — the engine emits a
+/// `Cancelled{SelfTradePrevented}` for the taker rather than resting it,
+/// regardless of TIF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchResult {
-    /// Number of fills appended to the caller's `out_buf`.
+    /// Number of fills appended to the caller's `out_fills`.
     pub fills_count: usize,
+    /// Number of STP cancellations appended to the caller's `out_stp`.
+    pub stp_cancellations: usize,
     /// Taker's remaining qty after the walk. `None` = fully consumed;
     /// `Some(qty)` where qty > 0 for partial consumption.
     pub taker_remaining: Option<Qty>,
+    /// `true` when the walk halted because the next maker belonged
+    /// to the taker's account — the taker is cancelled with
+    /// `SelfTradePrevented` regardless of TIF, taking precedence
+    /// over `Gtc` / `Ioc` resting policy.
+    pub taker_stp_cancelled: bool,
 }

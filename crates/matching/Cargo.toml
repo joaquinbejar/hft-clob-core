@@ -13,10 +13,6 @@ repository.workspace = true
 domain = { workspace = true }
 pricelevel = { workspace = true }
 thiserror = { workspace = true }
-# Required to construct `pricelevel::UuidGenerator(namespace: Uuid)`.
-# Pricelevel's match_order generates internal trade ids we discard;
-# our own `domain::TradeId` comes from the injected `IdGenerator` trait.
-uuid = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true

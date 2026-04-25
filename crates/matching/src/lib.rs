@@ -25,4 +25,4 @@ pub mod fill;
 
 pub use book::{Book, RestingOrder};
 pub use error::BookError;
-pub use fill::{AggressiveOrder, Fill, MatchResult};
+pub use fill::{AggressiveOrder, Fill, MatchResult, StpCancellation};
