@@ -81,12 +81,27 @@ build_examples() {
     cargo build --release --examples -p clob-client
 }
 
+restart_engine() {
+    if [[ "$SMOKE_USE_EXTERNAL_DEPS" == "1" ]]; then
+        # External engine — caller is responsible for state.
+        return 0
+    fi
+    docker compose -f "$COMPOSE_FILE" restart engine >/dev/null 2>&1 || true
+    wait_for_listener "$CLOB_ENGINE_ADDR" 10 >/dev/null
+}
+
 run_one() {
     local example="$1"
     local log_file="${LOG_DIR}/${example}.log"
     local start
     start=$(date +%s)
     local rc=0
+    # Each example needs a clean engine — `state accumulates` between
+    # runs against the same container (orders rest on the book, kill
+    # switch state persists, etc.). Restart the engine container
+    # before every example so each example starts from an empty book
+    # with the kill switch off.
+    restart_engine
     if timeout "${EXAMPLE_TIMEOUT_SECS}" cargo run --release --quiet --example "$example" -p clob-client \
         >"$log_file" 2>&1; then
         rc=0
