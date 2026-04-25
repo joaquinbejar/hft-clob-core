@@ -20,6 +20,9 @@
 pub mod book;
 /// Error types.
 pub mod error;
+/// Aggressive-order request and fill output types.
+pub mod fill;
 
 pub use book::{Book, RestingOrder};
 pub use error::BookError;
+pub use fill::{AggressiveOrder, Fill, MatchResult};
