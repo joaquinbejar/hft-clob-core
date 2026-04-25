@@ -131,6 +131,10 @@ fn zero_timestamps(ev: &mut Outbound) {
         Outbound::BookUpdateL2Delta(d) => {
             d.emit_ts = RecvTs::new(0);
         }
+        Outbound::SnapshotResponse(s) => {
+            s.recv_ts = RecvTs::new(0);
+            s.emit_ts = RecvTs::new(0);
+        }
     }
 }
 

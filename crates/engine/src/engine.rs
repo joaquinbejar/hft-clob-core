@@ -36,7 +36,9 @@ use matching::{
 use risk::{RiskState, notional_of};
 use wire::inbound::{
     CancelOrder, CancelReplace, Inbound, KillSwitchSet, KillSwitchState, MassCancel, NewOrder,
+    SnapshotRequest,
 };
+use wire::outbound::snapshot_response::{Level as SnapshotLevel, SnapshotResponse};
 use wire::outbound::{BookUpdateTop, ExecReport, Outbound, TradePrint};
 
 use marketdata::OutboundSink;
@@ -139,10 +141,36 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             Inbound::CancelReplace(msg) => self.handle_cancel_replace(msg, recv_ts),
             Inbound::MassCancel(msg) => self.handle_mass_cancel(msg, recv_ts),
             Inbound::KillSwitchSet(msg) => self.handle_kill_switch(msg),
-            // SnapshotRequest support is intentionally deferred —
-            // tracked separately under the marketdata snapshot work.
-            Inbound::SnapshotRequest(_) => {}
+            Inbound::SnapshotRequest(msg) => self.handle_snapshot_request(msg, recv_ts),
         }
+    }
+
+    fn handle_snapshot_request(&mut self, msg: SnapshotRequest, recv_ts: RecvTs) {
+        // Walk the book in deterministic best-first order. Empty
+        // levels are filtered (`total_quantity()` may transiently
+        // report 0 during pricelevel's lazy cleanup; replay must
+        // not see phantom levels).
+        let bids: Vec<SnapshotLevel> = self
+            .book
+            .bid_levels()
+            .filter(|(_, qty)| *qty > 0)
+            .filter_map(|(price, qty)| Qty::new(qty).ok().map(|q| SnapshotLevel { price, qty: q }))
+            .collect();
+        let asks: Vec<SnapshotLevel> = self
+            .book
+            .ask_levels()
+            .filter(|(_, qty)| *qty > 0)
+            .filter_map(|(price, qty)| Qty::new(qty).ok().map(|q| SnapshotLevel { price, qty: q }))
+            .collect();
+        let response = SnapshotResponse {
+            engine_seq: self.next_seq(),
+            request_id: msg.request_id,
+            recv_ts,
+            emit_ts: self.clock.now(),
+            bids,
+            asks,
+        };
+        self.sink.emit(Outbound::SnapshotResponse(response));
     }
 
     // -----------------------------------------------------------------
@@ -779,6 +807,7 @@ mod tests {
                 Outbound::TradePrint(t) => t.engine_seq.as_raw(),
                 Outbound::BookUpdateTop(b) => b.engine_seq.as_raw(),
                 Outbound::BookUpdateL2Delta(d) => d.engine_seq.as_raw(),
+                Outbound::SnapshotResponse(s) => s.engine_seq.as_raw(),
             })
             .collect()
     }

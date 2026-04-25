@@ -11,7 +11,9 @@
 //! decoded frame; gap detection is built into the contract.
 
 use wire::framing::{Frame, MessageKind};
-use wire::outbound::{Outbound, book_update_l2_delta, book_update_top, exec_report, trade_print};
+use wire::outbound::{
+    Outbound, book_update_l2_delta, book_update_top, exec_report, snapshot_response, trade_print,
+};
 use wire::{WireError, framing};
 
 /// Encode one [`Outbound`] event into a framed byte sequence appended
@@ -40,6 +42,10 @@ pub fn encode(msg: &Outbound, out: &mut Vec<u8>) -> Result<(), WireError> {
         Outbound::BookUpdateL2Delta(d) => {
             book_update_l2_delta::encode(d, &mut payload);
             MessageKind::BookUpdateL2Delta
+        }
+        Outbound::SnapshotResponse(s) => {
+            snapshot_response::encode(s, &mut payload);
+            MessageKind::SnapshotResponse
         }
     };
     Frame::write(kind, &payload, out)?;

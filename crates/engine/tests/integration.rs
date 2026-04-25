@@ -75,6 +75,7 @@ fn smoke_100_orders_engine_seq_is_strictly_monotonic_after_decode() {
             Outbound::TradePrint(t) => t.engine_seq.as_raw(),
             Outbound::BookUpdateTop(b) => b.engine_seq.as_raw(),
             Outbound::BookUpdateL2Delta(d) => d.engine_seq.as_raw(),
+            Outbound::SnapshotResponse(s) => s.engine_seq.as_raw(),
         };
         assert!(
             seq > last_seq,
@@ -125,6 +126,96 @@ fn smoke_trade_print_emits_exactly_once_per_fill() {
         .filter(|o| matches!(o, Outbound::TradePrint(_)))
         .count();
     assert_eq!(trade_count, 2);
+}
+
+#[test]
+fn smoke_snapshot_request_returns_book_levels_in_best_first_order() {
+    use wire::inbound::SnapshotRequest;
+    let mut engine = Engine::new(
+        StubClock::new(1_000_000_000),
+        CounterIdGenerator::new(),
+        VecSink::new(),
+    );
+    // Bids: 100, 99, 95 (descending = best first).
+    engine.step(Inbound::NewOrder(limit_order(1, 7, Side::Bid, 99, 5)));
+    engine.step(Inbound::NewOrder(limit_order(2, 7, Side::Bid, 100, 3)));
+    engine.step(Inbound::NewOrder(limit_order(3, 7, Side::Bid, 95, 7)));
+    // Asks: 101, 105, 110 (ascending = best first).
+    engine.step(Inbound::NewOrder(limit_order(4, 2, Side::Ask, 110, 4)));
+    engine.step(Inbound::NewOrder(limit_order(5, 2, Side::Ask, 101, 6)));
+    engine.step(Inbound::NewOrder(limit_order(6, 2, Side::Ask, 105, 2)));
+    let _ = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+
+    engine.step(Inbound::SnapshotRequest(SnapshotRequest { request_id: 42 }));
+    let events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    let snap = events
+        .iter()
+        .find_map(|o| match o {
+            Outbound::SnapshotResponse(s) => Some(s),
+            _ => None,
+        })
+        .expect("SnapshotResponse emitted");
+    assert_eq!(snap.request_id, 42);
+    let bid_prices: Vec<i64> = snap.bids.iter().map(|l| l.price.as_ticks()).collect();
+    let ask_prices: Vec<i64> = snap.asks.iter().map(|l| l.price.as_ticks()).collect();
+    assert_eq!(bid_prices, vec![100, 99, 95], "bids best-first");
+    assert_eq!(ask_prices, vec![101, 105, 110], "asks best-first");
+    let bid_qtys: Vec<u64> = snap.bids.iter().map(|l| l.qty.as_lots()).collect();
+    let ask_qtys: Vec<u64> = snap.asks.iter().map(|l| l.qty.as_lots()).collect();
+    assert_eq!(bid_qtys, vec![3, 5, 7]);
+    assert_eq!(ask_qtys, vec![6, 2, 4]);
+}
+
+#[test]
+fn smoke_snapshot_request_on_empty_book_returns_empty_levels() {
+    use wire::inbound::SnapshotRequest;
+    let mut engine = Engine::new(
+        StubClock::new(1_000_000_000),
+        CounterIdGenerator::new(),
+        VecSink::new(),
+    );
+    engine.step(Inbound::SnapshotRequest(SnapshotRequest { request_id: 1 }));
+    let events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    let snap = events
+        .iter()
+        .find_map(|o| match o {
+            Outbound::SnapshotResponse(s) => Some(s),
+            _ => None,
+        })
+        .expect("SnapshotResponse emitted");
+    assert!(snap.bids.is_empty());
+    assert!(snap.asks.is_empty());
+}
+
+#[test]
+fn smoke_snapshot_response_round_trips_through_marketdata_encoder() {
+    use wire::inbound::SnapshotRequest;
+    let mut engine = Engine::new(
+        StubClock::new(1_000_000_000),
+        CounterIdGenerator::new(),
+        VecSink::new(),
+    );
+    engine.step(Inbound::NewOrder(limit_order(1, 7, Side::Bid, 100, 5)));
+    engine.step(Inbound::NewOrder(limit_order(2, 2, Side::Ask, 101, 3)));
+    let _ = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+
+    engine.step(Inbound::SnapshotRequest(SnapshotRequest { request_id: 9 }));
+    let events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    let original = events
+        .iter()
+        .find_map(|o| match o {
+            Outbound::SnapshotResponse(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("snapshot present");
+    let mut bytes = Vec::new();
+    encoder::encode(&Outbound::SnapshotResponse(original.clone()), &mut bytes).expect("encode");
+    let (decoded, total) = encoder::decode(&bytes).expect("decode");
+    assert_eq!(total, bytes.len());
+    match decoded {
+        Outbound::SnapshotResponse(decoded) => assert_eq!(decoded, original),
+        _ => panic!("decoded variant mismatch"),
+    }
 }
 
 /// Helper to drain the inner `VecSink` from the typed `Engine`.
