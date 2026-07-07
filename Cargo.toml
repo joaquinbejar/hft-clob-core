@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.86"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 license = "MIT"
 repository = "https://github.com/joaquinbejar/hft-clob-core"
