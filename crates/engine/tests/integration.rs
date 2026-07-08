@@ -587,6 +587,54 @@ fn cancel_replace_onto_own_order_stp_cancels_both() {
 }
 
 #[test]
+fn cancel_replace_from_non_owner_is_rejected_book_unchanged() {
+    use domain::{ExecState, RejectReason};
+
+    let mut engine = Engine::new(
+        StubClock::new(1_000_000_000),
+        CounterIdGenerator::new(),
+        VecSink::new(),
+    );
+    engine.step(Inbound::NewOrder(limit_order(1, 2, Side::Ask, 100, 10)));
+    engine.step(Inbound::NewOrder(limit_order(2, 7, Side::Bid, 99, 10)));
+    let _ = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+
+    // Account 9 tries to reprice account 7's order through the
+    // spread. Must reject (as UnknownOrderId — no cross-account id
+    // leak) with zero book mutation.
+    engine.step(cancel_replace(2, 9, 100, 10));
+    let events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+
+    let rejects: Vec<_> = events
+        .iter()
+        .filter_map(|o| match o {
+            Outbound::ExecReport(r) if r.state == ExecState::Rejected => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejects.len(), 1);
+    assert_eq!(rejects[0].reject_reason, Some(RejectReason::UnknownOrderId));
+    assert!(!events.iter().any(|o| matches!(o, Outbound::TradePrint(_))));
+
+    let top = events
+        .iter()
+        .filter_map(|o| match o {
+            Outbound::BookUpdateTop(b) => Some(b),
+            _ => None,
+        })
+        .next_back()
+        .expect("top-of-book emitted");
+    assert_eq!(
+        top.bid.map(|(p, q)| (p.as_ticks(), q.as_lots())),
+        Some((99, 10))
+    );
+    assert_eq!(
+        top.ask.map(|(p, q)| (p.as_ticks(), q.as_lots())),
+        Some((100, 10))
+    );
+}
+
+#[test]
 fn cancel_replace_postonly_would_cross_is_rejected_book_unchanged() {
     use domain::{ExecState, RejectReason};
 

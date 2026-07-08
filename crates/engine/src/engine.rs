@@ -527,6 +527,23 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
         // notional and re-register the residual once the replace
         // commits.
         let old_entry = self.registry.get(&msg.order_id).copied();
+        // Ownership gate: only the owning account may replace the
+        // order. This matters post-#59 — a replace can now trade and
+        // fire STP under the requester's account, so a cross-account
+        // replace would book fills and notional incoherently. Report
+        // UnknownOrderId rather than a dedicated reason so foreign
+        // order ids do not leak across accounts.
+        if let Some(entry) = old_entry
+            && entry.account_id != msg.account_id
+        {
+            self.emit_rejected(
+                msg.order_id,
+                msg.account_id,
+                RejectReason::UnknownOrderId,
+                recv_ts,
+            );
+            return;
+        }
         // Scratch buffers reused; a lose-priority reprice can trade.
         self.fills_buf.clear();
         self.stp_buf.clear();
