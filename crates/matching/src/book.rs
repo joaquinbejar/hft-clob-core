@@ -497,20 +497,44 @@ impl Book {
 
     /// Cancel-and-replace a resting order. Priority is preserved
     /// only on a strict qty-down with no price change; any price
-    /// change or qty-up loses priority (cancel + re-add at the new
-    /// `(price, qty)`). Returns a [`ReplaceOutcome`] carrying
+    /// change or qty-up loses priority — CME iLink rule: qty-down
+    /// *with* a price change still goes to the back of the new
+    /// level's queue. Returns a [`ReplaceOutcome`] carrying
     /// `kept_priority` so the engine pipeline can stamp the
     /// `Replaced{kept_priority}` exec report correctly.
+    ///
+    /// The lose-priority path re-submits the new `(price, qty)`
+    /// through [`Book::match_aggressive`] under the order's stored
+    /// TIF — exactly the walk a brand-new order goes through — and
+    /// rests only the residual that does not cross (issue #59: the
+    /// old cancel-plus-re-add path rested a crossed book). The order
+    /// keeps its original `order_id` through any fills.
+    /// Consequences the caller must handle via `out_fills` /
+    /// `out_stp` and [`ReplaceOutcome::match_result`]:
+    ///
+    /// - A reprice through the opposite touch trades; fills are
+    ///   appended to `out_fills` with trade ids from `ids`.
+    /// - Self-trade prevention applies as on any aggressive entry:
+    ///   a reprice onto the account's own resting order cancels
+    ///   both (maker record in `out_stp`,
+    ///   [`MatchResult::taker_stp_cancelled`] set, nothing rests).
+    /// - A resting `PostOnly` order repriced to a would-cross price
+    ///   is rejected via [`MatchResult::taker_post_only_rejected`]
+    ///   with **zero book mutation** — the original order stays
+    ///   resting untouched, preserving its never-take guarantee.
     ///
     /// # Errors
     /// - [`BookError::UnknownOrderId`] when `order_id` is not present.
     /// - [`BookError::SeqOverflow`] on the cancel-and-readd path
     ///   when the internal arrival counter would overflow.
-    pub fn replace(
+    pub fn replace<I: IdGenerator>(
         &mut self,
         order_id: OrderId,
         new_price: Price,
         new_qty: Qty,
+        ids: &mut I,
+        out_fills: &mut Vec<Fill>,
+        out_stp: &mut Vec<StpCancellation>,
     ) -> Result<ReplaceOutcome, BookError> {
         let meta = *self.index.get(&order_id).ok_or(BookError::UnknownOrderId)?;
         let current_qty = self.resting_qty(order_id).unwrap_or(Qty::MIN);
@@ -521,7 +545,9 @@ impl Book {
         if kept_priority {
             // In-place qty update via pricelevel. Strict qty-down or
             // no-op (same qty + same price). The level keeps the
-            // order in its FIFO queue; nothing else changes.
+            // order in its FIFO queue; nothing else changes. A
+            // same-price qty-down cannot cross (the order was already
+            // resting at that price), so no matching walk is needed.
             let level = match meta.side {
                 Side::Bid => self.bids.get(&meta.price),
                 Side::Ask => self.asks.get(&meta.price),
@@ -531,29 +557,70 @@ impl Book {
                 order_id: PlId::Sequential(order_id.as_raw()),
                 new_quantity: PlQuantity::new(new_qty.as_lots()),
             });
-            // No sidecar mutation: side / price / account_id all
-            // unchanged.
-            Ok(ReplaceOutcome {
+            // No sidecar mutation: side / price / account_id / tif
+            // all unchanged.
+            return Ok(ReplaceOutcome {
                 kept_priority: true,
-            })
-        } else {
-            // Lose-priority path: cancel + re-add at the new
-            // (price, qty). The order joins the tail of the new
-            // level's FIFO queue.
-            let account_id = meta.account_id;
-            self.cancel(order_id)?;
+                match_result: None,
+            });
+        }
+
+        // Lose-priority path. PostOnly gate first, before any
+        // mutation: the single-writer discipline guarantees the
+        // would-cross answer stays valid through the rest of this
+        // call, so rejecting here leaves the original order resting
+        // untouched.
+        if meta.tif == Tif::PostOnly && self.would_cross(meta.side, Some(new_price)) {
+            return Ok(ReplaceOutcome {
+                kept_priority: false,
+                match_result: Some(MatchResult {
+                    fills_count: 0,
+                    stp_cancellations: 0,
+                    taker_remaining: Some(new_qty),
+                    taker_stp_cancelled: false,
+                    taker_post_only_rejected: true,
+                }),
+            });
+        }
+
+        // Cancel, then re-submit the new (price, qty) through the
+        // matching walk. The PostOnly case was already gated above,
+        // so the walk's own arrival gate cannot fire here.
+        let account_id = meta.account_id;
+        self.cancel(order_id)?;
+        let result = self.match_aggressive(
+            AggressiveOrder {
+                order_id,
+                account_id,
+                side: meta.side,
+                price: Some(new_price),
+                qty: new_qty,
+                tif: meta.tif,
+            },
+            ids,
+            out_fills,
+            out_stp,
+        );
+
+        // An STP cancel-both drops the taker too — nothing rests.
+        // Otherwise rest the residual; by construction of the walk
+        // it can no longer cross, so the book stays uncrossed.
+        if !result.taker_stp_cancelled
+            && let Some(remaining) = result.taker_remaining
+        {
             self.add_resting(RestingOrder {
                 order_id,
                 account_id,
                 side: meta.side,
                 price: new_price,
-                qty: new_qty,
+                qty: remaining,
                 tif: meta.tif,
             })?;
-            Ok(ReplaceOutcome {
-                kept_priority: false,
-            })
         }
+        Ok(ReplaceOutcome {
+            kept_priority: false,
+            match_result: Some(result),
+        })
     }
 
     /// Cancel every resting order owned by `account`. Each cancelled
@@ -745,13 +812,24 @@ mod tests {
     }
 
     fn order_acct(id: u64, account: u32, side: Side, price: i64, qty: u64) -> RestingOrder {
+        order_tif(id, account, side, price, qty, Tif::Gtc)
+    }
+
+    fn order_tif(
+        id: u64,
+        account: u32,
+        side: Side,
+        price: i64,
+        qty: u64,
+        tif: Tif,
+    ) -> RestingOrder {
         RestingOrder {
             order_id: OrderId::new(id).expect("valid order_id fixture"),
             account_id: AccountId::new(account).expect("valid account_id fixture"),
             side,
             price: Price::new(price).expect("valid price fixture"),
             qty: Qty::new(qty).expect("valid qty fixture"),
-            tif: Tif::Gtc,
+            tif,
         }
     }
 
@@ -1476,18 +1554,42 @@ mod tests {
     // Replace (cancel-replace)
     // -------------------------------------------------------------------
 
+    /// Drive `Book::replace` with a fresh `MockIds` + scratch buffers,
+    /// returning everything a test needs to assert on.
+    #[allow(clippy::type_complexity)]
+    fn do_replace(
+        book: &mut Book,
+        id: u64,
+        price: i64,
+        qty: u64,
+    ) -> (
+        Result<ReplaceOutcome, BookError>,
+        Vec<Fill>,
+        Vec<StpCancellation>,
+    ) {
+        let mut ids = MockIds::new();
+        let mut fills = Vec::new();
+        let mut stp = stp_buf();
+        let r = book.replace(
+            OrderId::new(id).expect("ok"),
+            Price::new(price).expect("ok"),
+            Qty::new(qty).expect("ok"),
+            &mut ids,
+            &mut fills,
+            &mut stp,
+        );
+        (r, fills, stp)
+    }
+
     #[test]
     fn test_replace_qty_down_same_price_keeps_priority() {
         let mut book = Book::new();
         book.add_resting(order(1, Side::Bid, 100, 10)).expect("add");
-        let outcome = book
-            .replace(
-                OrderId::new(1).expect("ok"),
-                Price::new(100).expect("ok"),
-                Qty::new(7).expect("ok"),
-            )
-            .expect("replace");
+        let (outcome, fills, _) = do_replace(&mut book, 1, 100, 7);
+        let outcome = outcome.expect("replace");
         assert!(outcome.kept_priority);
+        assert_eq!(outcome.match_result, None);
+        assert!(fills.is_empty());
         assert_eq!(book.side_qty(Side::Bid), 7);
         assert_eq!(book.best_bid(), Some(Price::new(100).expect("ok")));
     }
@@ -1496,14 +1598,10 @@ mod tests {
     fn test_replace_qty_up_same_price_loses_priority() {
         let mut book = Book::new();
         book.add_resting(order(1, Side::Bid, 100, 10)).expect("add");
-        let outcome = book
-            .replace(
-                OrderId::new(1).expect("ok"),
-                Price::new(100).expect("ok"),
-                Qty::new(15).expect("ok"),
-            )
-            .expect("replace");
+        let (outcome, fills, _) = do_replace(&mut book, 1, 100, 15);
+        let outcome = outcome.expect("replace");
         assert!(!outcome.kept_priority);
+        assert!(fills.is_empty());
         assert_eq!(book.side_qty(Side::Bid), 15);
         assert_eq!(book.best_bid(), Some(Price::new(100).expect("ok")));
     }
@@ -1512,14 +1610,10 @@ mod tests {
     fn test_replace_price_change_loses_priority() {
         let mut book = Book::new();
         book.add_resting(order(1, Side::Bid, 100, 10)).expect("add");
-        let outcome = book
-            .replace(
-                OrderId::new(1).expect("ok"),
-                Price::new(99).expect("ok"),
-                Qty::new(10).expect("ok"),
-            )
-            .expect("replace");
+        let (outcome, fills, _) = do_replace(&mut book, 1, 99, 10);
+        let outcome = outcome.expect("replace");
         assert!(!outcome.kept_priority);
+        assert!(fills.is_empty());
         assert_eq!(book.best_bid(), Some(Price::new(99).expect("ok")));
         assert_eq!(book.side_qty(Side::Bid), 10);
     }
@@ -1527,11 +1621,7 @@ mod tests {
     #[test]
     fn test_replace_unknown_order_id_returns_err() {
         let mut book = Book::new();
-        let r = book.replace(
-            OrderId::new(99).expect("ok"),
-            Price::new(100).expect("ok"),
-            Qty::new(5).expect("ok"),
-        );
+        let (r, _, _) = do_replace(&mut book, 99, 100, 5);
         assert_eq!(r, Err(BookError::UnknownOrderId));
     }
 
@@ -1542,13 +1632,8 @@ mod tests {
         let mut book = Book::new();
         book.add_resting(order(1, Side::Bid, 100, 5)).expect("add");
         book.add_resting(order(2, Side::Bid, 100, 5)).expect("add");
-        let _ = book
-            .replace(
-                OrderId::new(1).expect("ok"),
-                Price::new(100).expect("ok"),
-                Qty::new(3).expect("ok"),
-            )
-            .expect("replace");
+        let (outcome, _, _) = do_replace(&mut book, 1, 100, 3);
+        assert!(outcome.expect("replace").kept_priority);
         let mut ids = MockIds::new();
         let mut fills = Vec::new();
         let mut stp = stp_buf();
@@ -1561,6 +1646,137 @@ mod tests {
         assert_eq!(r.fills_count, 1);
         // FIFO preserved: id 1 (oldest) hit first.
         assert_eq!(fills[0].maker_order_id, OrderId::new(1).expect("ok"));
+    }
+
+    // Regression tests for issue #59: a lose-priority replace must
+    // re-run the matching walk, never rest a crossed book.
+
+    #[test]
+    fn test_replace_reprice_through_spread_trades_and_book_not_crossed() {
+        // Issue #59 repro: SELL 10@100 (acct 1) + BUY 10@99 (acct 2),
+        // then reprice the buy to 100 — through the spread. Must trade
+        // in full and leave the book flat, not rest 100/100 crossed.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 1, Side::Ask, 100, 10))
+            .expect("add");
+        book.add_resting(order_acct(2, 2, Side::Bid, 99, 10))
+            .expect("add");
+        let (outcome, fills, stp) = do_replace(&mut book, 2, 100, 10);
+        let outcome = outcome.expect("replace");
+        assert!(!outcome.kept_priority);
+        let result = outcome.match_result.expect("walk ran");
+        assert_eq!(result.fills_count, 1);
+        assert_eq!(result.taker_remaining, None);
+        assert!(stp.is_empty());
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].maker_order_id, OrderId::new(1).expect("ok"));
+        assert_eq!(fills[0].taker_order_id, OrderId::new(2).expect("ok"));
+        assert_eq!(fills[0].price, Price::new(100).expect("ok"));
+        assert_eq!(fills[0].qty, Qty::new(10).expect("ok"));
+        assert!(fills[0].maker_fully_filled);
+        // Book flat on both sides — never crossed.
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.side_qty(Side::Bid), 0);
+        assert_eq!(book.side_qty(Side::Ask), 0);
+    }
+
+    #[test]
+    fn test_replace_reprice_partial_cross_rests_residual() {
+        // SELL 5@100 vs BUY 10@99 repriced to 100: 5 lots trade, the
+        // 5-lot residual rests as the new best bid at 100.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 1, Side::Ask, 100, 5))
+            .expect("add");
+        book.add_resting(order_acct(2, 2, Side::Bid, 99, 10))
+            .expect("add");
+        let (outcome, fills, _) = do_replace(&mut book, 2, 100, 10);
+        let result = outcome.expect("replace").match_result.expect("walk ran");
+        assert_eq!(result.fills_count, 1);
+        assert_eq!(result.taker_remaining, Some(Qty::new(5).expect("ok")));
+        assert_eq!(fills[0].qty, Qty::new(5).expect("ok"));
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.best_bid(), Some(Price::new(100).expect("ok")));
+        assert_eq!(book.side_qty(Side::Bid), 5);
+    }
+
+    #[test]
+    fn test_replace_reprice_onto_own_order_stp_cancel_both() {
+        // Same account on both sides. Repricing the bid through the
+        // spread hits the account's own ask: cancel-both — no fill,
+        // maker dropped, taker not rested. Identical to a new order.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 7, Side::Ask, 100, 10))
+            .expect("add");
+        book.add_resting(order_acct(2, 7, Side::Bid, 99, 10))
+            .expect("add");
+        let (outcome, fills, stp) = do_replace(&mut book, 2, 100, 10);
+        let result = outcome.expect("replace").match_result.expect("walk ran");
+        assert!(result.taker_stp_cancelled);
+        assert!(fills.is_empty());
+        assert_eq!(stp.len(), 1);
+        assert_eq!(stp[0].order_id, OrderId::new(1).expect("ok"));
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn test_replace_noncrossing_reprice_rests_no_fills() {
+        // Reprice away from the touch: pure cancel-and-re-add, no walk
+        // consequences observable.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 1, Side::Ask, 100, 10))
+            .expect("add");
+        book.add_resting(order_acct(2, 2, Side::Bid, 99, 10))
+            .expect("add");
+        let (outcome, fills, stp) = do_replace(&mut book, 2, 98, 10);
+        let result = outcome.expect("replace").match_result.expect("walk ran");
+        assert_eq!(result.fills_count, 0);
+        assert!(fills.is_empty());
+        assert!(stp.is_empty());
+        assert_eq!(book.best_bid(), Some(Price::new(98).expect("ok")));
+        assert_eq!(book.best_ask(), Some(Price::new(100).expect("ok")));
+        assert_eq!(book.side_qty(Side::Bid), 10);
+    }
+
+    #[test]
+    fn test_replace_postonly_would_cross_rejected_book_unchanged() {
+        // A resting PostOnly bid repriced through the spread keeps its
+        // never-take guarantee: the replace is rejected with zero book
+        // mutation and the original order stays resting.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 1, Side::Ask, 100, 10))
+            .expect("add");
+        book.add_resting(order_tif(2, 2, Side::Bid, 99, 10, Tif::PostOnly))
+            .expect("add");
+        let (outcome, fills, stp) = do_replace(&mut book, 2, 100, 10);
+        let result = outcome.expect("replace").match_result.expect("gate fired");
+        assert!(result.taker_post_only_rejected);
+        assert!(fills.is_empty());
+        assert!(stp.is_empty());
+        // Original order untouched at its old (price, qty).
+        assert_eq!(book.best_bid(), Some(Price::new(99).expect("ok")));
+        assert_eq!(book.best_ask(), Some(Price::new(100).expect("ok")));
+        assert_eq!(book.side_qty(Side::Bid), 10);
+        assert_eq!(book.side_qty(Side::Ask), 10);
+    }
+
+    #[test]
+    fn test_replace_postonly_noncrossing_reprice_rests() {
+        // A PostOnly reprice that does not cross behaves like any
+        // other lose-priority reprice: cancel + re-add, no fills.
+        let mut book = Book::new();
+        book.add_resting(order_acct(1, 1, Side::Ask, 100, 10))
+            .expect("add");
+        book.add_resting(order_tif(2, 2, Side::Bid, 99, 10, Tif::PostOnly))
+            .expect("add");
+        let (outcome, fills, _) = do_replace(&mut book, 2, 98, 10);
+        let result = outcome.expect("replace").match_result.expect("walk ran");
+        assert!(!result.taker_post_only_rejected);
+        assert_eq!(result.fills_count, 0);
+        assert!(fills.is_empty());
+        assert_eq!(book.best_bid(), Some(Price::new(98).expect("ok")));
+        assert_eq!(book.side_qty(Side::Bid), 10);
     }
 
     // -------------------------------------------------------------------

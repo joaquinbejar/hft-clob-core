@@ -619,8 +619,20 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
         // notional and re-register the new one once the replace
         // commits.
         let old_entry = self.registry.get(&msg.order_id).copied();
-        let outcome: Result<ReplaceOutcome, _> =
-            self.book.replace(msg.order_id, msg.new_price, msg.new_qty);
+        // Scratch buffers reused; a lose-priority reprice can trade.
+        // NOTE: fill / STP emission for these buffers lands in the
+        // follow-up engine commit; this call only adopts the new
+        // matching-core signature.
+        self.fills_buf.clear();
+        self.stp_buf.clear();
+        let outcome: Result<ReplaceOutcome, _> = self.book.replace(
+            msg.order_id,
+            msg.new_price,
+            msg.new_qty,
+            &mut self.ids,
+            &mut self.fills_buf,
+            &mut self.stp_buf,
+        );
         match outcome {
             Ok(replaced) => {
                 if let Some(entry) = old_entry {
