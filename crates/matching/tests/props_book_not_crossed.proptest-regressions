@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4d736c015cfa55ca516dff7ceaeff3c53133ad4863db917347f6301512018bcf # shrinks to commands = [NewOrder { order_id: 32, account_id: 1, side: Bid, price: 90, qty: 1, tif: Gtc }, NewOrder { order_id: 1, account_id: 1, side: Bid, price: 90, qty: 1, tif: Gtc }, NewOrder { order_id: 2, account_id: 1, side: Ask, price: 91, qty: 1, tif: Gtc }, Replace { order_id: 32, new_price: 91, new_qty: 1 }]

@@ -2,7 +2,7 @@
 //! Ensures that the matching engine preserves critical invariants under all valid sequences
 //! of add, cancel, and match operations.
 
-use domain::{AccountId, OrderId, Price, Qty, Side};
+use domain::{AccountId, OrderId, Price, Qty, Side, Tif};
 use matching::{Book, RestingOrder};
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -81,6 +81,7 @@ fn apply_commands(book: &mut Book, commands: &[Command]) -> (HashMap<u64, OrderE
                         side: *side,
                         price: p,
                         qty: q,
+                        tif: Tif::Gtc,
                     };
                     if book.add_resting(resting).is_ok() {
                         order_map.insert(*order_id, (*side, p, q, acc_id));

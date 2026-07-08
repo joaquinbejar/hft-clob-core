@@ -104,7 +104,7 @@ fn generate_ops(n: u64, seed: u64) -> Vec<Op> {
     for _ in 0..n {
         let r = rng.next() % 100;
         let account = ((rng.next() % ACCOUNT_COUNT) + 1) as u32;
-        let side = if rng.next().is_multiple_of(2) {
+        let side = if rng.next() % 2 == 0 {
             Side::Bid
         } else {
             Side::Ask

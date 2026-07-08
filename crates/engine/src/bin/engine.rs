@@ -155,7 +155,7 @@ fn engine_loop(rx: mpsc::Receiver<Inbound>, sink: ChannelSink) {
     while let Ok(msg) = rx.recv() {
         engine.step(msg);
         count = count.wrapping_add(1);
-        if count.is_multiple_of(10_000) && count != last_log {
+        if count % 10_000 == 0 && count != last_log {
             eprintln!("engine: processed {count} inbound commands");
             last_log = count;
         }

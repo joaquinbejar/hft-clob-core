@@ -248,6 +248,16 @@ record carries the residual qty and price), the walk halts, and
 `Cancelled{SelfTradePrevented}` for the taker — regardless of TIF,
 including `Gtc` and `Ioc`.
 
+STP fires on **every** aggressive entry, including a cancel-replace
+that reprices through the spread onto the account's own resting
+order: both the repriced order and the resting maker cancel,
+exactly as if a new order had arrived at that level. Each side gets
+its own `Cancelled{SelfTradePrevented}` report, so clients can
+reconstruct causality. Note the policy is **account-scoped** —
+broader than CME's SMP-group model — so a single account can never
+cross its own quotes; two-sided quoting is safe only while the
+account's own bid stays below its own ask.
+
 **Why cancel-both, not "cancel maker, fill taker against the next
 queue entry"**: the cancel-both policy is the cleanest way to
 prevent wash-trade-like patterns from appearing on the public
@@ -259,15 +269,44 @@ the spec references in `doc/DESIGN.md` § 5.2.
 
 Strict qty-down with no price change preserves FIFO position via
 `pricelevel::UpdateQuantity` in place — `ReplaceOutcome { kept_priority: true }`.
-Any price change or qty-up loses priority: the existing order is
-cancelled and the new `(price, qty)` is added at the tail of the
-new level — `kept_priority: false`.
+Any price change or qty-up loses priority — including a qty-down
+**with** a price change (CME iLink rule: any price change goes to
+the back of the new level's queue) — `kept_priority: false`.
+
+The lose-priority path re-submits the new `(price, qty)` through
+the same matching walk a brand-new order goes through, honoring the
+order's stored TIF (issue #59; NASDAQ OUCH / CME iLink semantics —
+a marketable modify executes):
+
+- A reprice through the opposite touch **trades**; only the
+  non-crossing residual rests, at the tail of its level.
+- The order keeps its original `order_id` through any fills. The
+  stream sequence makes this reconstructable: the non-terminal
+  `Replaced` ack (`leaves_qty = new_qty`) is emitted **first**,
+  then trade prints and maker/taker fill reports decrement it,
+  ending in a terminal `Filled`/`Cancelled` when the order does
+  not survive.
+- A reprice onto the account's own resting order fires STP
+  cancel-both (see above) — nothing rests.
+- A resting `PostOnly` order repriced to a would-cross price is
+  rejected with `PostOnlyWouldCross` and **zero book mutation** —
+  the original order stays resting, preserving its never-take
+  guarantee.
+- Only the owning account may replace an order; a foreign replace
+  is rejected as `UnknownOrderId` so order ids do not leak across
+  accounts.
 
 **Why qty-up loses priority**: bumping a resting order's qty up at
 the head of the queue would let a passive participant claim a
 priority advantage they did not earn. Cancel-and-readd is the
 unambiguous way to enforce that. Same rationale for any price
 change: the new price's queue is unrelated to the old one.
+
+**Report-shape asymmetry (known)**: a new order that partially
+fills emits its fills first and then an `Accepted` for the
+residual, while a replace acks first (`Replaced`) and lets the
+fill reports follow. Unifying the two sequences would change the
+golden replay fixture; tracked as a follow-up.
 
 ### Market order in a thin book
 
@@ -291,6 +330,12 @@ such order can arrive); inside `match_aggressive`, the loop
 verifies `taker_price >= level_price` (Bid) / `<=` (Ask) at every
 level entry, so by construction the post-step book has
 `best_bid < best_ask`.
+
+This invariant now covers the cancel-replace path too: before
+issue #59 a lose-priority reprice through the spread rested the
+new price without re-matching, leaving the book crossed. The
+`book_not_crossed` proptest asserts `best_bid < best_ask` after
+every operation in random add / cancel / replace sequences.
 
 ### Post-only
 

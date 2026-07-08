@@ -114,6 +114,13 @@ pub struct ReplaceOutcome {
     /// order was cancel-and-re-added at the new (price, qty) — any
     /// price change or qty-up loses priority.
     pub kept_priority: bool,
+    /// `Some` when the lose-priority path ran the matching walk (or
+    /// its `PostOnly` would-cross gate fired — signalled by
+    /// [`MatchResult::taker_post_only_rejected`] with zero book
+    /// mutation). `None` on the kept-priority in-place path: a
+    /// same-price qty-down was already resting without crossing, so
+    /// no walk is needed.
+    pub match_result: Option<MatchResult>,
 }
 
 /// Summary of one [`crate::Book::match_aggressive`] call.
