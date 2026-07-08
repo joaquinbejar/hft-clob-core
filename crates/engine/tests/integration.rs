@@ -46,7 +46,7 @@ fn smoke_100_orders_engine_seq_is_strictly_monotonic_after_decode() {
     for i in 0..50u64 {
         let id = 1000 + i;
         // Some buys cross (price >= 100), some don't (rest at 50..).
-        let price = if i.is_multiple_of(2) { 200 } else { 50 };
+        let price = if i % 2 == 0 { 200 } else { 50 };
         let qty = (i % 5) + 1;
         engine.step(Inbound::NewOrder(limit_order(id, 7, Side::Bid, price, qty)));
     }
