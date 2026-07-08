@@ -368,105 +368,13 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             return;
         }
 
-        // Stage 4b: emit per-fill. For each fill we publish the trade
-        // print and the two corresponding exec reports (maker + taker
-        // partial / full). Order: trade print first, then exec
-        // reports — `engine_seq` strictly monotonic across all three.
-        let mut taker_remaining_lots = msg.qty.as_lots();
-        // Snapshot len before mutating; clippy would flag the implicit
-        // borrow if we reused `&self.fills_buf` in the loop body.
-        let fills_count = self.fills_buf.len();
-        for i in 0..fills_count {
-            let fill = self.fills_buf[i];
-            taker_remaining_lots = taker_remaining_lots.saturating_sub(fill.qty.as_lots());
-            self.emit_trade_print_for_fill(&fill, msg.side, recv_ts);
-            // Maker exec report.
-            let maker_acct = self
-                .registry
-                .get(&fill.maker_order_id)
-                .map(|e| e.account_id)
-                .unwrap_or(msg.account_id);
-            let maker_state = if fill.maker_fully_filled {
-                ExecState::Filled
-            } else {
-                ExecState::PartiallyFilled
-            };
-            // Compute the maker's residual qty AFTER this fill so the
-            // partial-fill exec report's `leaves_qty` is correct.
-            // Full-fill terminates the maker → leaves is None.
-            let maker_leaves = if fill.maker_fully_filled {
-                None
-            } else {
-                self.registry.get(&fill.maker_order_id).and_then(|e| {
-                    let new_lots = e.qty.as_lots().saturating_sub(fill.qty.as_lots());
-                    Qty::new(new_lots).ok()
-                })
-            };
-            self.emit_exec_report_fill(
-                fill.maker_order_id,
-                maker_acct,
-                maker_state,
-                fill.price,
-                fill.qty,
-                maker_leaves,
-                recv_ts,
-            );
-            // Taker exec report — partial until the last fill that
-            // empties the taker, then Filled.
-            let taker_state = if taker_remaining_lots == 0 {
-                ExecState::Filled
-            } else {
-                ExecState::PartiallyFilled
-            };
-            let taker_leaves = if taker_remaining_lots == 0 {
-                None
-            } else {
-                Qty::new(taker_remaining_lots).ok()
-            };
-            self.emit_exec_report_fill(
-                msg.order_id,
-                msg.account_id,
-                taker_state,
-                fill.price,
-                fill.qty,
-                taker_leaves,
-                recv_ts,
-            );
-            // Risk-state book-keeping for the maker. Full fill drops
-            // the registry entry and refunds the resting notional.
-            self.risk.on_fill(fill.price);
-            if fill.maker_fully_filled {
-                if let Some(entry) = self.registry.remove(&fill.maker_order_id) {
-                    self.risk.on_order_removed(entry.account_id, entry.notional);
-                }
-            } else if let Some(entry) = self.registry.get_mut(&fill.maker_order_id) {
-                let consumed_notional = notional_of(fill.price, fill.qty);
-                let new_notional = entry.notional.saturating_sub(consumed_notional);
-                let new_qty_lots = entry.qty.as_lots().saturating_sub(fill.qty.as_lots());
-                self.risk
-                    .on_order_removed(entry.account_id, consumed_notional);
-                entry.notional = new_notional;
-                if let Ok(q) = Qty::new(new_qty_lots) {
-                    entry.qty = q;
-                }
-            }
-        }
+        // Stage 4b: per-fill emission + maker book-keeping (shared
+        // with the cancel-replace handler).
+        self.emit_fills_for_taker(msg.order_id, msg.account_id, msg.qty, recv_ts);
 
-        // Stage 4c: per-STP-cancel — emit a Cancelled exec report for
-        // each maker dropped, plus refund risk state.
-        let stp_count = self.stp_buf.len();
-        for i in 0..stp_count {
-            let stp = self.stp_buf[i];
-            self.emit_exec_report_cancelled(
-                stp.order_id,
-                stp.account_id,
-                CancelReason::SelfTradePrevented,
-                recv_ts,
-            );
-            if let Some(entry) = self.registry.remove(&stp.order_id) {
-                self.risk.on_order_removed(entry.account_id, entry.notional);
-            }
-        }
+        // Stage 4c: per-STP-cancel emission + refunds (shared with
+        // the cancel-replace handler).
+        self.emit_stp_cancels(recv_ts);
 
         // Stage 4d: taker terminal disposition. STP cancels the taker
         // unconditionally (regardless of TIF). Otherwise route by TIF.
@@ -616,13 +524,10 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             return;
         }
         // Snapshot the old registry entry so we can refund the old
-        // notional and re-register the new one once the replace
+        // notional and re-register the residual once the replace
         // commits.
         let old_entry = self.registry.get(&msg.order_id).copied();
         // Scratch buffers reused; a lose-priority reprice can trade.
-        // NOTE: fill / STP emission for these buffers lands in the
-        // follow-up engine commit; this call only adopts the new
-        // matching-core signature.
         self.fills_buf.clear();
         self.stp_buf.clear();
         let outcome: Result<ReplaceOutcome, _> = self.book.replace(
@@ -633,40 +538,102 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             &mut self.fills_buf,
             &mut self.stp_buf,
         );
-        match outcome {
-            Ok(replaced) => {
-                if let Some(entry) = old_entry {
-                    self.risk.on_order_removed(entry.account_id, entry.notional);
-                }
-                let new_notional = notional_of(msg.new_price, msg.new_qty);
-                if let Err(reason) = self.risk.on_order_resting(msg.account_id, new_notional) {
-                    // Replace-up would blow the cap. Roll back: the
-                    // matching core has already mutated the book, so
-                    // we cancel the residual to maintain invariants.
-                    let _ = self.book.cancel(msg.order_id);
-                    self.registry.remove(&msg.order_id);
-                    self.emit_rejected(msg.order_id, msg.account_id, reason, recv_ts);
-                } else {
-                    self.registry.insert(
-                        msg.order_id,
-                        OrderRegistryEntry {
-                            account_id: msg.account_id,
-                            side: old_entry.map(|e| e.side).unwrap_or(Side::Bid),
-                            qty: msg.new_qty,
-                            notional: new_notional,
-                        },
-                    );
-                    let _ = replaced;
-                    self.emit_exec_report_replaced(msg.order_id, msg.account_id, recv_ts);
-                }
+        let replaced = match outcome {
+            Ok(replaced) => replaced,
+            Err(_) => {
+                self.emit_rejected(
+                    msg.order_id,
+                    msg.account_id,
+                    RejectReason::UnknownOrderId,
+                    recv_ts,
+                );
+                return;
             }
-            Err(_) => self.emit_rejected(
+        };
+
+        // A would-cross reprice of a resting PostOnly order was
+        // rejected by the matching core with zero book mutation — the
+        // original order is still resting at its old (price, qty), so
+        // risk / registry state stays exactly as it was.
+        if replaced
+            .match_result
+            .is_some_and(|r| r.taker_post_only_rejected)
+        {
+            self.emit_rejected(
                 msg.order_id,
                 msg.account_id,
-                RejectReason::UnknownOrderId,
+                RejectReason::PostOnlyWouldCross,
                 recv_ts,
-            ),
+            );
+            return;
         }
+
+        // The replace committed: the old (price, qty) incarnation is
+        // gone. Refund its notional and drop its registry entry; the
+        // residual (if any) is re-registered below with its own
+        // notional.
+        if let Some(entry) = old_entry {
+            self.risk.on_order_removed(entry.account_id, entry.notional);
+        }
+        self.registry.remove(&msg.order_id);
+
+        // Replaced ack FIRST (OUCH-style): the modify committed, the
+        // order now stands at (new_price, new_qty). Non-terminal —
+        // `leaves_qty = new_qty`; any fills follow under later seqs
+        // and decrement it, ending in a terminal Filled / Cancelled
+        // when the order does not survive.
+        self.emit_exec_report_replaced(msg.order_id, msg.account_id, msg.new_qty, recv_ts);
+
+        // Fill + STP emission, shared with handle_new_order. On the
+        // kept-priority path both buffers are empty and these are
+        // no-ops.
+        self.emit_fills_for_taker(msg.order_id, msg.account_id, msg.new_qty, recv_ts);
+        self.emit_stp_cancels(recv_ts);
+
+        // Taker disposition. `match_result` is None on the
+        // kept-priority in-place path: nothing traded, the full new
+        // qty rests.
+        let (taker_stp_cancelled, taker_remaining) = match replaced.match_result {
+            Some(r) => (r.taker_stp_cancelled, r.taker_remaining),
+            None => (false, Some(msg.new_qty)),
+        };
+        if taker_stp_cancelled {
+            // Cancel-both STP: the repriced order was dropped by the
+            // walk and did not rest.
+            self.emit_exec_report_cancelled(
+                msg.order_id,
+                msg.account_id,
+                CancelReason::SelfTradePrevented,
+                recv_ts,
+            );
+        } else if let Some(remaining) = taker_remaining {
+            let resting_notional = notional_of(msg.new_price, remaining);
+            if let Err(reason) = self.risk.on_order_resting(msg.account_id, resting_notional) {
+                // The residual would blow the account cap. Fills
+                // stand — trades are unrollbackable — so cancel only
+                // the resting remainder.
+                let _ = self.book.cancel(msg.order_id);
+                self.emit_rejected(msg.order_id, msg.account_id, reason, recv_ts);
+            } else {
+                self.registry.insert(
+                    msg.order_id,
+                    OrderRegistryEntry {
+                        account_id: msg.account_id,
+                        // The book is authoritative for the side; the
+                        // registry snapshot is a mirror. Fall back to
+                        // the fill's maker side when the mirror was
+                        // out of sync (defensive, unreachable in a
+                        // consistent pipeline).
+                        side: old_entry.map(|e| e.side).unwrap_or(Side::Bid),
+                        qty: remaining,
+                        notional: resting_notional,
+                    },
+                );
+            }
+        }
+        // taker_remaining == None: fully filled by the reprice — the
+        // last taker fill report was terminal Filled and the registry
+        // entry is already gone.
         // Book changes emitted in `step` after handler returns.
     }
 
@@ -723,6 +690,124 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
 
     fn next_seq(&mut self) -> EngineSeq {
         self.ids.next_engine_seq()
+    }
+
+    /// Per-fill emission + maker book-keeping over `fills_buf`.
+    /// Shared by the new-order and cancel-replace handlers: for each
+    /// fill publish the trade print and the two exec reports (maker +
+    /// taker, partial / full), bump the risk price-band reference,
+    /// and consume the maker's registry entry / resting notional.
+    /// Order per fill: trade print first, then exec reports —
+    /// `engine_seq` strictly monotonic across all three. The
+    /// aggressor side is derived per fill (`maker_side.opposite()`),
+    /// so the caller only supplies the taker's identity and its
+    /// pre-walk qty (for `leaves_qty` computation).
+    fn emit_fills_for_taker(
+        &mut self,
+        taker_order_id: OrderId,
+        taker_account: AccountId,
+        taker_qty: Qty,
+        recv_ts: RecvTs,
+    ) {
+        let mut taker_remaining_lots = taker_qty.as_lots();
+        // Snapshot len before mutating; clippy would flag the implicit
+        // borrow if we reused `&self.fills_buf` in the loop body.
+        let fills_count = self.fills_buf.len();
+        for i in 0..fills_count {
+            let fill = self.fills_buf[i];
+            taker_remaining_lots = taker_remaining_lots.saturating_sub(fill.qty.as_lots());
+            self.emit_trade_print_for_fill(&fill, fill.maker_side.opposite(), recv_ts);
+            // Maker exec report.
+            let maker_acct = self
+                .registry
+                .get(&fill.maker_order_id)
+                .map(|e| e.account_id)
+                .unwrap_or(taker_account);
+            let maker_state = if fill.maker_fully_filled {
+                ExecState::Filled
+            } else {
+                ExecState::PartiallyFilled
+            };
+            // Compute the maker's residual qty AFTER this fill so the
+            // partial-fill exec report's `leaves_qty` is correct.
+            // Full-fill terminates the maker → leaves is None.
+            let maker_leaves = if fill.maker_fully_filled {
+                None
+            } else {
+                self.registry.get(&fill.maker_order_id).and_then(|e| {
+                    let new_lots = e.qty.as_lots().saturating_sub(fill.qty.as_lots());
+                    Qty::new(new_lots).ok()
+                })
+            };
+            self.emit_exec_report_fill(
+                fill.maker_order_id,
+                maker_acct,
+                maker_state,
+                fill.price,
+                fill.qty,
+                maker_leaves,
+                recv_ts,
+            );
+            // Taker exec report — partial until the last fill that
+            // empties the taker, then Filled.
+            let taker_state = if taker_remaining_lots == 0 {
+                ExecState::Filled
+            } else {
+                ExecState::PartiallyFilled
+            };
+            let taker_leaves = if taker_remaining_lots == 0 {
+                None
+            } else {
+                Qty::new(taker_remaining_lots).ok()
+            };
+            self.emit_exec_report_fill(
+                taker_order_id,
+                taker_account,
+                taker_state,
+                fill.price,
+                fill.qty,
+                taker_leaves,
+                recv_ts,
+            );
+            // Risk-state book-keeping for the maker. Full fill drops
+            // the registry entry and refunds the resting notional.
+            self.risk.on_fill(fill.price);
+            if fill.maker_fully_filled {
+                if let Some(entry) = self.registry.remove(&fill.maker_order_id) {
+                    self.risk.on_order_removed(entry.account_id, entry.notional);
+                }
+            } else if let Some(entry) = self.registry.get_mut(&fill.maker_order_id) {
+                let consumed_notional = notional_of(fill.price, fill.qty);
+                let new_notional = entry.notional.saturating_sub(consumed_notional);
+                let new_qty_lots = entry.qty.as_lots().saturating_sub(fill.qty.as_lots());
+                self.risk
+                    .on_order_removed(entry.account_id, consumed_notional);
+                entry.notional = new_notional;
+                if let Ok(q) = Qty::new(new_qty_lots) {
+                    entry.qty = q;
+                }
+            }
+        }
+    }
+
+    /// Per-STP-cancel emission + refunds over `stp_buf`. Shared by
+    /// the new-order and cancel-replace handlers: one
+    /// `Cancelled{SelfTradePrevented}` exec report per dropped maker,
+    /// plus registry / resting-notional refund.
+    fn emit_stp_cancels(&mut self, recv_ts: RecvTs) {
+        let stp_count = self.stp_buf.len();
+        for i in 0..stp_count {
+            let stp = self.stp_buf[i];
+            self.emit_exec_report_cancelled(
+                stp.order_id,
+                stp.account_id,
+                CancelReason::SelfTradePrevented,
+                recv_ts,
+            );
+            if let Some(entry) = self.registry.remove(&stp.order_id) {
+                self.risk.on_order_removed(entry.account_id, entry.notional);
+            }
+        }
     }
 
     fn emit_rejected(
@@ -810,13 +895,16 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
         // Replace lose-priority vs keep-priority is signalled at the
         // matching layer; the wire `ExecReport` does not surface it
         // (a follow-up wires a dedicated bit for that).
+        new_qty: Qty,
         recv_ts: RecvTs,
     ) {
-        // The wire `ExecReport` does not carry `kept_priority` as a
-        // field; that signal lives in `CancelReason::Replaced` paired
-        // with a follow-up `Accepted` for the new resting order in
-        // the lose-priority case. v1 emits a single `Replaced`
-        // terminal exec report for the old order id.
+        // Non-terminal modify ack, emitted BEFORE any fills the
+        // reprice produces (OUCH-style: ack first, executions after).
+        // `leaves_qty = new_qty` — the order stands at the new
+        // (price, qty) as of this seq; later fill reports decrement
+        // it. `cancel_reason: Replaced` marks the end of the old
+        // (price, qty) incarnation, not of the order: the same
+        // order_id lives on.
         let report = ExecReport {
             engine_seq: self.next_seq(),
             order_id,
@@ -824,7 +912,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             state: ExecState::Replaced,
             fill_price: None,
             fill_qty: None,
-            leaves_qty: None,
+            leaves_qty: Some(new_qty),
             reject_reason: None,
             cancel_reason: Some(CancelReason::Replaced),
             recv_ts,
