@@ -499,6 +499,7 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
                         side: msg.side,
                         price,
                         qty: remaining,
+                        tif: msg.tif,
                     };
                     let resting_notional = notional_of(price, remaining);
                     // Risk re-confirms the post-trade caps before

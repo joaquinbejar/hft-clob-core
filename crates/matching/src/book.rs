@@ -28,6 +28,11 @@ struct OrderMeta {
     side: Side,
     price: Price,
     account_id: AccountId,
+    /// Time-in-force the order rested with. Read by the
+    /// cancel-replace path: a repriced `PostOnly` order keeps its
+    /// never-take guarantee (a would-cross reprice is rejected), so
+    /// the original TIF must survive the resting period.
+    tif: Tif,
 }
 
 /// A resting-order request handed to [`Book::add_resting`].
@@ -47,6 +52,10 @@ pub struct RestingOrder {
     pub price: Price,
     /// Order quantity.
     pub qty: Qty,
+    /// Time-in-force the order arrived with. `Ioc` never rests, so
+    /// only `Gtc` / `PostOnly` are meaningful here; the value is
+    /// stored in the sidecar and honored by [`Book::replace`].
+    pub tif: Tif,
 }
 
 /// Single-symbol order book.
@@ -105,6 +114,10 @@ impl Book {
         if self.index.contains_key(&order.order_id) {
             return Err(BookError::DuplicateOrderId);
         }
+        // `Ioc` is a taker-only policy — the engine cancels any IOC
+        // remainder instead of resting it, so an IOC here is a caller
+        // bug, not a reachable state.
+        debug_assert!(order.tif != Tif::Ioc, "IOC orders never rest");
         // Bump the arrival counter first so `TimestampMs` reflects the
         // post-add value rather than lagging by one. CLAUDE.md forbids
         // `wrapping_*` / `saturating_*` on protocol counters; surface
@@ -147,6 +160,7 @@ impl Book {
                 side: order.side,
                 price: order.price,
                 account_id: order.account_id,
+                tif: order.tif,
             },
         );
         self.by_account
@@ -534,6 +548,7 @@ impl Book {
                 side: meta.side,
                 price: new_price,
                 qty: new_qty,
+                tif: meta.tif,
             })?;
             Ok(ReplaceOutcome {
                 kept_priority: false,
@@ -736,6 +751,7 @@ mod tests {
             side,
             price: Price::new(price).expect("valid price fixture"),
             qty: Qty::new(qty).expect("valid qty fixture"),
+            tif: Tif::Gtc,
         }
     }
 
@@ -892,7 +908,8 @@ mod tests {
                 let added = book.add_resting(RestingOrder {
                     order_id: id,
                     account_id: AccountId::new(1).expect("ok"),
-                    side: *side, price: *price, qty: *qty
+                    side: *side, price: *price, qty: *qty,
+                    tif: Tif::Gtc,
                 });
                 if added.is_ok() {
                     ids.push(id);
