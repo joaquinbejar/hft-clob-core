@@ -482,6 +482,26 @@ impl<C: Clock, I: IdGenerator, S: OutboundSink> Engine<C, I, S> {
             // Book updates emitted in `step` after the handler returns.
             return;
         }
+        // Ownership gate: only the owning account may cancel the
+        // order (mirrors the cancel-replace gate from #59/#60). The
+        // registry mirrors the book 1:1 in the single-writer
+        // pipeline, so the engine-level check suffices — Book::cancel
+        // keeps its requester-less signature because the matching
+        // core also cancels on the engine's own authority (fills,
+        // STP, mass-cancel). Report UnknownOrderId rather than a
+        // dedicated reason so foreign order ids do not leak across
+        // accounts.
+        if let Some(entry) = self.registry.get(&msg.order_id)
+            && entry.account_id != msg.account_id
+        {
+            self.emit_rejected(
+                msg.order_id,
+                msg.account_id,
+                RejectReason::UnknownOrderId,
+                recv_ts,
+            );
+            return;
+        }
         if self.book.cancel(msg.order_id).is_ok() {
             if let Some(entry) = self.registry.remove(&msg.order_id) {
                 self.risk.on_order_removed(entry.account_id, entry.notional);

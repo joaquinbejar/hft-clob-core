@@ -385,6 +385,90 @@ fn engine_inner_sink(engine: &mut Engine<StubClock, CounterIdGenerator, VecSink>
 }
 
 // ---------------------------------------------------------------------
+// Cancel ownership (issue #61)
+// ---------------------------------------------------------------------
+
+#[test]
+fn cancel_from_non_owner_is_rejected_book_unchanged() {
+    use domain::{CancelReason, ExecState, RejectReason};
+    use wire::inbound::CancelOrder;
+
+    let mut engine = Engine::new(
+        StubClock::new(1_000_000_000),
+        CounterIdGenerator::new(),
+        VecSink::new(),
+    );
+    engine.step(Inbound::NewOrder(limit_order(1, 7, Side::Bid, 100, 5)));
+    let _ = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+
+    // Account 9 tries to cancel account 7's order. Must reject (as
+    // UnknownOrderId — no cross-account id leak) with zero mutation.
+    engine.step(Inbound::CancelOrder(CancelOrder {
+        client_ts: ClientTs::new(0),
+        order_id: OrderId::new(1).expect("ok"),
+        account_id: AccountId::new(9).expect("ok"),
+    }));
+    let events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+
+    let rejects: Vec<_> = events
+        .iter()
+        .filter_map(|o| match o {
+            Outbound::ExecReport(r) if r.state == ExecState::Rejected => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejects.len(), 1);
+    assert_eq!(rejects[0].reject_reason, Some(RejectReason::UnknownOrderId));
+    assert!(
+        !events
+            .iter()
+            .any(|o| matches!(o, Outbound::ExecReport(r) if r.state == ExecState::Cancelled)),
+        "foreign cancel must not cancel"
+    );
+    let top = events
+        .iter()
+        .filter_map(|o| match o {
+            Outbound::BookUpdateTop(b) => Some(b),
+            _ => None,
+        })
+        .next_back()
+        .expect("top-of-book emitted");
+    assert_eq!(
+        top.bid.map(|(p, q)| (p.as_ticks(), q.as_lots())),
+        Some((100, 5))
+    );
+
+    // Regression: the owning account can still cancel.
+    engine.step(Inbound::CancelOrder(CancelOrder {
+        client_ts: ClientTs::new(0),
+        order_id: OrderId::new(1).expect("ok"),
+        account_id: AccountId::new(7).expect("ok"),
+    }));
+    let events = std::mem::take(&mut engine_inner_sink(&mut engine).events);
+    let cancelled: Vec<_> = events
+        .iter()
+        .filter_map(|o| match o {
+            Outbound::ExecReport(r) if r.state == ExecState::Cancelled => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(
+        cancelled[0].cancel_reason,
+        Some(CancelReason::UserRequested)
+    );
+    let top = events
+        .iter()
+        .filter_map(|o| match o {
+            Outbound::BookUpdateTop(b) => Some(b),
+            _ => None,
+        })
+        .next_back()
+        .expect("top-of-book emitted");
+    assert_eq!(top.bid, None);
+}
+
+// ---------------------------------------------------------------------
 // Cancel-replace re-match (issue #59)
 // ---------------------------------------------------------------------
 
