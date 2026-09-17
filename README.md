@@ -555,3 +555,17 @@ the engine's latency is a function of `num_kinds` rather than
 `num_sessions`. Both of these land cleanly because matching
 binds to `OutboundSink`, not to the broadcast channel — the
 topology change is a sink swap in one place.
+
+<!-- related-projects:start -->
+## Related projects
+
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Depends on
+
+| Repository | Description |
+|------------|-------------|
+| [IronSBE](https://github.com/joaquinbejar/IronSBE) · [crates.io](https://crates.io/crates/ironsbe-core) | Rust implementation of Simple Binary Encoding (SBE) for ultra-low-latency systems. |
+| [PriceLevel](https://github.com/joaquinbejar/PriceLevel) · [crates.io](https://crates.io/crates/pricelevel) | Lock-free price level implementation for limit order books. |
+
+<!-- related-projects:end -->
