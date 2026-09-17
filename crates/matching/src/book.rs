@@ -148,11 +148,25 @@ impl Book {
         // Insert (or create) the level and enqueue the order in one
         // pass. `add_order` takes `&self`, so the `&mut Arc<PriceLevel>`
         // returned by `or_insert_with` auto-derefs without an extra
-        // `Arc::clone` on the steady-state path.
-        levels
+        // `Arc::clone` on the steady-state path. Since pricelevel 0.9
+        // `add_order` is fallible (duplicate id, level counter
+        // overflow); the level is unchanged on `Err`, so unwind the
+        // arrival counter and prune an empty freshly-created level to
+        // keep the book unchanged too.
+        let level = levels
             .entry(order.price)
-            .or_insert_with(|| Arc::new(PriceLevel::new(price_u128)))
-            .add_order(pl_order);
+            .or_insert_with(|| Arc::new(PriceLevel::new(price_u128)));
+        if let Err(e) = level.add_order(pl_order) {
+            let empty = level.order_count() == 0;
+            if empty {
+                levels.remove(&order.price);
+            }
+            self.seq -= 1;
+            return Err(match e {
+                pricelevel::PriceLevelError::DuplicateOrderId(_) => BookError::DuplicateOrderId,
+                _ => BookError::LevelRejected,
+            });
+        }
 
         self.index.insert(
             order.order_id,
@@ -381,7 +395,7 @@ impl Book {
                 // STP gate. Cancel-both: drop the maker, halt the
                 // walk, signal taker cancel.
                 if head_meta.account_id == taker.account_id {
-                    let head_qty_raw = head.visible_quantity();
+                    let head_qty_raw = head.visible_quantity().as_u64();
                     let head_qty = Qty::new(head_qty_raw).unwrap_or(Qty::MIN);
                     debug_assert!(head_qty_raw > 0, "resting order with zero qty");
                     let _ = level_arc.update_order(PlOrderUpdate::Cancel {
@@ -410,7 +424,7 @@ impl Book {
                 }
 
                 // Normal fill against this maker.
-                let head_qty_raw = head.visible_quantity();
+                let head_qty_raw = head.visible_quantity().as_u64();
                 if head_qty_raw == 0 {
                     debug_assert!(false, "pricelevel queue head has zero qty");
                     break 'walk;
@@ -659,7 +673,7 @@ impl Book {
                     // level; per-order qty needs the queue lookup.
                     l.iter_orders()
                         .find(|o| o.id() == PlId::Sequential(order_id.as_raw()))
-                        .map(|o| o.visible_quantity())
+                        .map(|o| o.visible_quantity().as_u64())
                 })
                 .and_then(|q| Qty::new(q).ok())
                 .unwrap_or(Qty::MIN);
@@ -702,7 +716,7 @@ impl Book {
         let order = level
             .iter_orders()
             .find(|o| o.id() == PlId::Sequential(order_id.as_raw()))?;
-        Qty::new(order.visible_quantity()).ok()
+        Qty::new(order.visible_quantity().as_u64()).ok()
     }
 
     /// Best bid price, or `None` when the bid side is empty.

@@ -23,41 +23,41 @@ categories = ["finance"]
 
 [workspace.dependencies]
 # Internal workspace crates.
-domain     = { path = "crates/domain",     version = "0.1.0" }
-matching   = { path = "crates/matching",   version = "0.1.0" }
-risk       = { path = "crates/risk",       version = "0.1.0" }
-gateway    = { path = "crates/gateway",    version = "0.1.0" }
-marketdata = { path = "crates/marketdata", version = "0.1.0" }
-engine     = { path = "crates/engine",     version = "0.1.0" }
-wire       = { path = "crates/wire",       version = "0.1.0" }
-clob-client = { path = "crates/clob-client", version = "0.1.0" }
+domain     = { path = "crates/domain",     version = "0.1" }
+matching   = { path = "crates/matching",   version = "0.1" }
+risk       = { path = "crates/risk",       version = "0.1" }
+gateway    = { path = "crates/gateway",    version = "0.1" }
+marketdata = { path = "crates/marketdata", version = "0.1" }
+engine     = { path = "crates/engine",     version = "0.1" }
+wire       = { path = "crates/wire",       version = "0.1" }
+clob-client = { path = "crates/clob-client", version = "0.1" }
 
 # External local crates — sibling repos, path deps. See CLAUDE.md for relaxations
 # that cover dashmap / uuid / ulid / atomics introduced by these libs.
-pricelevel         = "0.7"
-ironsbe-core       = "0.3"
-ironsbe-schema     = "0.3"
-ironsbe-codegen    = "0.3"
-ironsbe-derive     = "0.3"
-ironsbe-channel    = "0.3"
-ironsbe-transport  = "0.3"
-ironsbe-server     = "0.3"
-ironsbe-client     = "0.3"
-ironsbe-marketdata = "0.3"
+pricelevel         = "0.9"
+ironsbe-core       = "0.7"
+ironsbe-schema     = "0.7"
+ironsbe-codegen    = "0.7"
+ironsbe-derive     = "0.7"
+ironsbe-channel    = "0.7"
+ironsbe-transport  = "0.7"
+ironsbe-server     = "0.7"
+ironsbe-client     = "0.7"
+ironsbe-marketdata = "0.7"
 
 # Third-party — single source of truth for versions across crates.
 thiserror         = "2.0"
 anyhow            = "1.0"
-bytes             = "1.11"
+bytes             = "1.12"
 crossbeam         = "0.8"
 crossbeam-queue   = "0.3"
 parking_lot       = "0.12"
-tokio             = { version = "1.52", default-features = false }
+tokio             = { version = "1.53", default-features = false }
 tracing           = "0.1"
 tracing-subscriber = "0.3"
 serde             = { version = "1", features = ["derive"] }
 serde_json        = "1"
-hdrhistogram      = "7.5"
+hdrhistogram      = "7.6"
 criterion         = { version = "0.8", default-features = false, features = ["html_reports"] }
 proptest          = "1.11"
 zerocopy          = { version = "0.8", features = ["derive"] }
