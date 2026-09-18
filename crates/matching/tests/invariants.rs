@@ -156,7 +156,7 @@ proptest! {
         let mut book = Book::new();
         let (order_map, _) = apply_commands(&mut book, &commands);
 
-        for (_, (_, price, qty, _)) in order_map.iter() {
+        for (_, price, qty, _) in order_map.values() {
             prop_assert!(price.as_ticks() > 0, "Price must be positive");
             prop_assert!(qty.as_lots() > 0, "Quantity must be positive");
         }

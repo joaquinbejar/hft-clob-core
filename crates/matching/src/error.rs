@@ -14,4 +14,10 @@ pub enum BookError {
     /// Sequence counter would overflow.
     #[error("sequence counter overflow")]
     SeqOverflow,
+
+    /// The price level refused to admit the order (a per-level
+    /// quantity or order-count counter would overflow). The book is
+    /// left unchanged.
+    #[error("price level rejected the order")]
+    LevelRejected,
 }
