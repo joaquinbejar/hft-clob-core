@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.86"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
@@ -23,14 +23,14 @@ categories = ["finance"]
 
 [workspace.dependencies]
 # Internal workspace crates.
-domain     = { path = "crates/domain",     version = "0.1" }
-matching   = { path = "crates/matching",   version = "0.1" }
-risk       = { path = "crates/risk",       version = "0.1" }
-gateway    = { path = "crates/gateway",    version = "0.1" }
-marketdata = { path = "crates/marketdata", version = "0.1" }
-engine     = { path = "crates/engine",     version = "0.1" }
-wire       = { path = "crates/wire",       version = "0.1" }
-clob-client = { path = "crates/clob-client", version = "0.1" }
+domain     = { path = "crates/domain",     version = "0.2" }
+matching   = { path = "crates/matching",   version = "0.2" }
+risk       = { path = "crates/risk",       version = "0.2" }
+gateway    = { path = "crates/gateway",    version = "0.2" }
+marketdata = { path = "crates/marketdata", version = "0.2" }
+engine     = { path = "crates/engine",     version = "0.2" }
+wire       = { path = "crates/wire",       version = "0.2" }
+clob-client = { path = "crates/clob-client", version = "0.2" }
 
 # External local crates — sibling repos, path deps. See CLAUDE.md for relaxations
 # that cover dashmap / uuid / ulid / atomics introduced by these libs.
