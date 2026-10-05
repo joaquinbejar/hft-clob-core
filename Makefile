@@ -417,9 +417,15 @@ tree:
 check-cargo-nextest:
 	@command -v cargo-nextest > /dev/null || (echo "Installing cargo-nextest..."; cargo install cargo-nextest --locked)
 
+# cargo-tarpaulin < 0.37.5 cannot read coverage data from Rust 1.99+, so a
+# stale local install is upgraded rather than reused.
 .PHONY: check-cargo-tarpaulin
 check-cargo-tarpaulin:
-	@command -v cargo-tarpaulin > /dev/null || (echo "Installing cargo-tarpaulin..."; cargo install cargo-tarpaulin --locked)
+	@v=$$(cargo tarpaulin --version 2>/dev/null | awk '{print $$NF}'); \
+	if [ -z "$$v" ] || [ "$$(printf '%s\n' 0.37.5 "$$v" | sort -V | head -n1)" != "0.37.5" ]; then \
+		echo "Installing cargo-tarpaulin >= 0.37.5..."; \
+		cargo install cargo-tarpaulin --locked --version '>=0.37.5'; \
+	fi
 
 .PHONY: check-cargo-criterion
 check-cargo-criterion:
