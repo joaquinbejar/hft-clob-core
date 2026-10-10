@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.86"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
@@ -34,7 +34,7 @@ clob-client = { path = "crates/clob-client", version = "0.2" }
 
 # External local crates — sibling repos, path deps. See CLAUDE.md for relaxations
 # that cover dashmap / uuid / ulid / atomics introduced by these libs.
-pricelevel         = "0.9"
+pricelevel         = "0.10"
 ironsbe-core       = "0.7"
 ironsbe-schema     = "0.7"
 ironsbe-codegen    = "0.7"

@@ -372,7 +372,14 @@ impl Book {
             // for v1; a follow-up (#10/issue-bench) can lift this
             // into a Book-side `VecDeque<OrderId>` mirror to land at
             // zero alloc on the fill loop.
-            let head_snapshot = level_arc.snapshot_orders();
+            //
+            // Since pricelevel 0.10 the snapshot is fallible: it fails
+            // only when the Vec cannot be reserved. Nothing has been
+            // mutated for this level yet, so halting the walk leaves the
+            // book consistent and the taker keeps its remaining qty.
+            let Ok(head_snapshot) = level_arc.snapshot_orders() else {
+                break 'walk;
+            };
             let mut snap_idx = 0usize;
             'level: loop {
                 if remaining == 0 {
