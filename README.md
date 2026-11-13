@@ -556,6 +556,16 @@ the engine's latency is a function of `num_kinds` rather than
 binds to `OutboundSink`, not to the broadcast channel — the
 topology change is a sink swap in one place.
 
+## Contribution and Contact
+
+Contributions are welcome: fork the repository, create a branch, make sure the project builds and its tests pass, and open a pull request.
+
+### **Contact Information**
+- **Author**: Joaquín Béjar García
+- **Email**: jb@taunais.com
+- **Telegram**: [@joaquin_bejar](https://t.me/joaquin_bejar)
+- **Repository**: <https://github.com/joaquinbejar/hft-clob-core>
+
 <!-- related-projects:start -->
 ## Related projects
 
@@ -565,7 +575,7 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [IronSBE](https://github.com/joaquinbejar/IronSBE) · [crates.io](https://crates.io/crates/ironsbe-core) | Rust implementation of Simple Binary Encoding (SBE) for ultra-low-latency systems. |
-| [PriceLevel](https://github.com/joaquinbejar/PriceLevel) · [crates.io](https://crates.io/crates/pricelevel) | Lock-free price level implementation for limit order books. |
+| [IronSBE](https://github.com/joaquinbejar/IronSBE) | SBE codec, channels, transport and server crates behind the framed binary TCP gateway and the market data feed. |
+| [PriceLevel](https://github.com/joaquinbejar/PriceLevel) | Lock-free price level the matching crate builds the book's resting order queues on. |
 
 <!-- related-projects:end -->
